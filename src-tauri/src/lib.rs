@@ -252,6 +252,11 @@ fn probe_api(app: tauri::AppHandle) -> Vec<String> {
     crate::platforms::mihoyo::probe_report(&app)
 }
 
+#[tauri::command]
+fn apply_patch(app: tauri::AppHandle, game_id: String, patch_dir: String, dry_run: bool) -> Result<String, String> {
+    crate::platforms::mihoyo::apply_patch(&app, &game_id, &patch_dir, dry_run)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -259,7 +264,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_installed_games, bind_game, launch_game, get_running_games,
-            check_remote, start_download, cancel_download, probe_api,official_info, open_official,
+            check_remote, start_download, cancel_download, probe_api,official_info, 
+            open_official,
+            apply_patch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

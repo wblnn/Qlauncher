@@ -31,6 +31,8 @@ pub struct ChannelsFile {
     download_buffer_mb: Option<u64>,
     // 新增：下载限速(MB/s)，0 或不填为不限速。限速会自动让出 CPU
     download_speed_limit_mbps: Option<u64>,
+    // 新增：hpatchz.exe 路径，缺省 = 项目 src-tauri/hpatchz.exe
+    hpatchz_path: Option<String>,
 
 }
 
@@ -52,7 +54,7 @@ fn read_channels(app: &tauri::AppHandle) -> ChannelsFile {
             }
         }
     }
-    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None }
+    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None, hpatchz_path: None }
 }
 
 fn hyp_launcher_id(app: &tauri::AppHandle) -> (String, &'static str) {
@@ -66,6 +68,161 @@ fn hyp_launcher_id(app: &tauri::AppHandle) -> (String, &'static str) {
 /// P1：下载字节上限，0 = 不限制
 fn download_limit_bytes(app: &tauri::AppHandle) -> u64 {
     read_channels(app).download_limit_mb.unwrap_or(0) * 1024 * 1024
+}
+
+/// hpatchz.exe 位置：channels.json 覆盖 → 项目目录默认
+fn hpatchz_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let cfg = read_channels(app);
+    if let Some(p) = cfg.hpatchz_path.filter(|v| !v.trim().is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join("hpatchz.exe"))
+}
+
+/// 单文件 hdiff 合成：hpatchz <旧文件> <增量文件> <新文件>
+fn run_hpatchz(app: &tauri::AppHandle, old: &Path, diff: &Path, new: &Path) -> Result<(), String> {
+    let exe = hpatchz_exe(app)?;
+    if !exe.is_file() {
+        return Err(format!("找不到 hpatchz.exe: {}（去 HDiffPatch release 下载放到这里）", exe.display()));
+    }
+    let out = std::process::Command::new(&exe)
+        .arg(old).arg(diff).arg(new)
+        .output()
+        .map_err(|e| format!("调用 hpatchz 失败: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("hpatchz 退出码 {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+// ================= 差分合成 (hdiff) =================
+#[derive(Deserialize)]
+struct HDiffMap { #[serde(default)] diff_map: Vec<HDiffEntry> }
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct HDiffEntry {
+    #[serde(default)] source_file_name: String,
+    #[serde(default)] source_file_md5: String,
+    #[serde(default)] source_file_size: u64,
+    #[serde(default)] target_file_name: String,
+    #[serde(default)] target_file_md5: String,
+    #[serde(default)] target_file_size: u64,
+    #[serde(default)] patch_file_name: String,
+    #[serde(default)] patch_file_md5: String,
+    #[serde(default)] patch_file_size: u64,
+}
+
+fn file_md5(path: &Path) -> Result<String, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut ctx = md5::Context::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        ctx.consume(&buf[..n]);
+    }
+    Ok(format!("{:x}", ctx.compute()))
+}
+
+/// 递归收集 extracted 里的"直接替换文件"（排除 .hdiff 增量和两个元文件）
+fn walk_replace_files(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() { walk_replace_files(&p, base, out); continue; }
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if fname == "hdiffmap.json" || fname == "deletefiles.txt" { continue; }
+            if fname.ends_with(".hdiff") { continue; }
+            out.push(p);
+        }
+    }
+}
+
+fn update_config_version(dir: &str, ver: &str) -> Result<(), String> {
+    let p = Path::new(dir).join("config.ini");
+    let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for line in s.lines() {
+        if line.trim().starts_with("game_version=") { out.push(format!("game_version={}", ver)); }
+        else { out.push(line.to_string()); }
+    }
+    std::fs::write(&p, out.join("\r\n")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 原地差分升级。dry_run=true 只校验+报计划，不写盘。
+pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_run: bool) -> Result<String, String> {
+    let game_dir = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
+    let extracted = Path::new(patch_dir).join("extracted");
+    let map: HDiffMap = serde_json::from_str(
+        &std::fs::read_to_string(extracted.join("hdiffmap.json")).map_err(|e| e.to_string())?
+    ).map_err(|e| format!("解析 hdiffmap.json 失败: {}", e))?;
+
+    let mut replace_files = Vec::new();
+    walk_replace_files(&extracted, &extracted, &mut replace_files);
+    let delete_list: Vec<String> = std::fs::read_to_string(extracted.join("deletefiles.txt"))
+        .unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+
+    let mut synthesized = 0usize; let mut replaced = 0usize;
+    let mut pending_delete: Vec<String> = delete_list.clone();
+
+    // 1) 合成 diff_map：old + hdiff -> temp -> 校验 -> rename 到 target -> 记录删 source
+    for (i, e) in map.diff_map.iter().enumerate() {
+        let old = Path::new(&game_dir).join(&e.source_file_name);
+        let diff = extracted.join(&e.patch_file_name);
+        let new = Path::new(&game_dir).join(&e.target_file_name);
+        if !old.exists() { return Err(format!("第{}条: 源文件缺失 {}（本地版本不匹配?）", i, e.source_file_name)); }
+        if !diff.exists() { return Err(format!("第{}条: 增量缺失 {}", i, e.patch_file_name)); }
+        let old_size = std::fs::metadata(&old).map(|m| m.len()).unwrap_or(0);
+        if old_size != e.source_file_size {
+            return Err(format!("第{}条: 源大小不符 {} 期望{} 实际{}", i, e.source_file_name, e.source_file_size, old_size));
+        }
+        if !dry_run {
+            let temp = PathBuf::from(format!("{}.qtmp", new.display()));
+            run_hpatchz(app, &old, &diff, &temp)?;
+            let got = file_md5(&temp)?;
+            if !e.target_file_md5.is_empty() && got != e.target_file_md5 {
+                let _ = std::fs::remove_file(&temp);
+                return Err(format!("第{}条: 合成 md5 不符 {} 期望{} 实际{}", i, e.target_file_name, e.target_file_md5, got));
+            }
+            if let Some(par) = new.parent() { std::fs::create_dir_all(par).map_err(|x| x.to_string())?; }
+            if new.exists() { let _ = std::fs::remove_file(&new); }
+            std::fs::rename(&temp, &new).map_err(|x| format!("rename 失败: {}", x))?;
+        }
+        synthesized += 1;
+        if e.source_file_name != e.target_file_name { pending_delete.push(e.source_file_name.clone()); }
+    }
+
+    // 2) 直接替换文件（dll/exe/pkg_version 等整文件覆盖）
+    for p in &replace_files {
+        let rel = p.strip_prefix(&extracted).unwrap().to_string_lossy().replace('\\', "/");
+        if !dry_run {
+            let dst = Path::new(&game_dir).join(&rel);
+            if let Some(par) = dst.parent() { std::fs::create_dir_all(par).map_err(|x| x.to_string())?; }
+            std::fs::copy(p, &dst).map_err(|x| format!("复制 {} 失败: {}", rel, x))?;
+        }
+        replaced += 1;
+    }
+
+    // 3) 删除（deletefiles + 已取代的 source 旧文件）
+    let deleted = pending_delete.len();
+    if !dry_run {
+        for rel in &pending_delete {
+            let f = Path::new(&game_dir).join(rel);
+            if f.exists() { let _ = std::fs::remove_file(&f); }
+        }
+    }
+
+    // 4) 更新 config.ini 版本号
+    if !dry_run {
+        if let Ok(v) = std::fs::read_to_string(extracted.join("pkg_version")) {
+            update_config_version(&game_dir, v.trim())?;
+        }
+    }
+
+    Ok(format!("{}：合成 {} 条 / 直接替换 {} 个 / 待删 {} 个",
+        if dry_run { "[预演] 计划" } else { "[完成]" }, synthesized, replaced, deleted))
 }
 
 fn hyp_get<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {

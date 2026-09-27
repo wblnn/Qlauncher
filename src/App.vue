@@ -170,6 +170,18 @@ async function openOfficial(gameId, mode) {
   catch (e) { alert('打开失败: ' + e) }
 }
 
+async function applyPatch(gameId) {
+  const dir = await open({ directory: true, multiple: false, title: '选择差分包目录 (patch_x_y)' })
+  if (!dir) return
+  try {
+    const plan = await invoke('apply_patch', { gameId, patchDir: dir, dryRun: true })
+    if (!confirm('预演计划:\n' + plan + '\n\n确认执行真实合成？\n(原地升级，不可回滚；失败可用官启"修复")')) return
+    const msg = await invoke('apply_patch', { gameId, patchDir: dir, dryRun: false })
+    alert(msg)
+    await loadGames()
+  } catch (e) { alert('应用差分失败: ' + e) }
+}
+
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 
@@ -218,6 +230,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               <button v-if="game.id !== 'test_notepad'" class="action-btn mini info" @click.stop="checkRemote(game.id)">📡 查版本</button>
               <button v-if="canDownload(game) && !progress[game.id]" class="action-btn mini dl" @click.stop="startDownload(game.id)">{{ downloadLabel(game) }}</button>
               <button v-if="progress[game.id]" class="action-btn mini cancel" @click.stop="cancelDownload(game.id)">✖ 取消</button>
+              <button v-if="game.status === '已安装' && game.platform === 'mihoyo'" class="action-btn mini" @click.stop="applyPatch(game.id)">🔧 应用差分</button>
             </template>
           </div>
           <div v-if="progress[game.id]" class="progress-wrap">           
