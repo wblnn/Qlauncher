@@ -232,7 +232,9 @@ fn start_download(app: tauri::AppHandle, game_id: String, dest: String, use_patc
     let app2 = app.clone(); let gid = game_id.clone();
     std::thread::spawn(move || {
         if let Err(e) = platform.download(&app2, &gid, &dest, use_patch, flag) {
-            let _ = app2.emit("download-progress", DownloadProgress { game_id: gid, downloaded: 0, total: 0, status: format!("error:{}", e) });
+            let _ = app2.emit("download-progress", DownloadProgress { 
+                game_id: gid, downloaded: 0, total: 0, speed: 0, eta_seconds: None, status: format!("error:{}", e) 
+            });
         }
     });
     Ok("下载任务已启动".into())

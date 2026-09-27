@@ -52,6 +52,8 @@ pub struct DownloadProgress {
     pub game_id: String,
     pub downloaded: u64,
     pub total: u64,
+    pub speed: u64,             // 字节/秒 (B/s)
+    pub eta_seconds: Option<u64>, // 预计剩余秒数 (None=计算中, Some(0)=已完成)
     pub status: String,
 }
 

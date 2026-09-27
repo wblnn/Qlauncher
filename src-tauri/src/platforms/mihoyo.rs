@@ -27,6 +27,11 @@ pub struct ChannelsFile {
     launcher_id: Option<String>,
     // P1：下载保命线（MB），0 或缺省 = 不限制
     download_limit_mb: Option<u64>,
+    // 新增：下载缓冲区大小(MB)，默认 4MB。越大 CPU 占用越低
+    download_buffer_mb: Option<u64>,
+    // 新增：下载限速(MB/s)，0 或不填为不限速。限速会自动让出 CPU
+    download_speed_limit_mbps: Option<u64>,
+
 }
 
 /// 配置三级来源：项目源码（开发期主配置，改文件即时生效）→ 用户目录（生产覆盖）→ 内置默认
@@ -47,7 +52,7 @@ fn read_channels(app: &tauri::AppHandle) -> ChannelsFile {
             }
         }
     }
-    ChannelsFile { launcher_id: None, download_limit_mb: None }
+    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None }
 }
 
 fn hyp_launcher_id(app: &tauri::AppHandle) -> (String, &'static str) {
@@ -289,32 +294,39 @@ impl GamePlatform for MihoyoPlatform {
             (info.parts.clone(), PathBuf::from(dest))
         };
 
-        std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-        let total: u64 = info.parts.iter().map(|p| p.size).sum();
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        let mut last_emit_downloaded: u64 = 0;
+        let total: u64 = parts.iter().map(|p| p.size).sum();
         let limit = download_limit_bytes(app); // P1：配置化保命线
         let mut downloaded: u64 = 0;
         let mut last_emit = Instant::now();
         let client = reqwest::blocking::Client::new();
         let mut saved: Vec<PathBuf> = Vec::new();
+        let cfg = read_channels(app);
+        let buf_size = (cfg.download_buffer_mb.unwrap_or(4) * 1024 * 1024) as usize;
+        let limit_bps = cfg.download_speed_limit_mbps.unwrap_or(0) * 1024 * 1024;
+        let mut buf = vec![0u8; buf_size]; 
 
-        for (idx, part) in info.parts.iter().enumerate() {
+        for (idx, part) in parts.iter().enumerate() {
             let fname = part.url.split('?').next().unwrap_or("").rsplit('/').next()
                 .unwrap_or(&format!("{}_{}.part{:03}", game_id, info.latest_version, idx + 1)).to_string();
-            let out_path = Path::new(dest).join(&fname);
+            let out_path = out_dir.join(&fname);
             let already = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
             if part.size > 0 && already == part.size {
                 downloaded += part.size;
-                println!("[download] 跳过已下完的第 {}/{} 卷：{}", idx + 1, info.parts.len(), fname);
+                println!("[download] 跳过已下完的第 {}/{} 卷：{}", idx + 1, parts.len(), fname);
                 saved.push(out_path);
                 continue;
             }
-            let mut stream = client.get(&part.url).send().map_err(|e| format!("第 {}/{} 卷请求失败: {}", idx + 1, info.parts.len(), e))?;
-            if !stream.status().is_success() { return Err(format!("第 {}/{} 卷 HTTP {}", idx + 1, info.parts.len(), stream.status())); }
-            println!("[download] 开始第 {}/{} 卷：{}（{}）", idx + 1, info.parts.len(), fname, crate::fmt_size(part.size));
+            let mut stream = client.get(&part.url).send().map_err(|e| format!("第 {}/{} 卷请求失败: {}", idx + 1, parts.len(), e))?;
+            if !stream.status().is_success() { return Err(format!("第 {}/{} 卷 HTTP {}", idx + 1, parts.len(), stream.status())); }
+            println!("[download] 开始第 {}/{} 卷：{}（{}）", idx + 1, parts.len(), fname, crate::fmt_size(part.size));
             let mut file = std::fs::File::create(&out_path).map_err(|e| format!("创建 {} 失败: {}", fname, e))?;
             let mut md5ctx = md5::Context::new();
-            let mut buf = vec![0u8; 64 * 1024];
             loop {
+
+                let loop_start = Instant::now(); // 记录本次循环开始时间
+                
                 if cancel.load(AtomicOrdering::Relaxed) {
                     drop(file); let _ = std::fs::remove_file(&out_path);
                     return Err("已取消".into());
@@ -322,7 +334,7 @@ impl GamePlatform for MihoyoPlatform {
                 if limit > 0 && downloaded >= limit {
                     drop(file);
                     println!("[download] 🧪 已达保命线 {} MB，安全截断", limit / 1024 / 1024);
-                    let _ = app.emit("download-progress", DownloadProgress { game_id: game_id.into(), downloaded, total, status: format!("done_test:{}", dest) });
+                    let _ = app.emit("download-progress", DownloadProgress { game_id: game_id.into(), downloaded, total, speed: 0, eta_seconds: Some(0), status: format!("done_test:{}", dest) });
                     return Ok(format!("管道测试成功：截断于 {} MB，文件在 {}", limit / 1024 / 1024, dest));
                 }
                 let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
@@ -330,9 +342,35 @@ impl GamePlatform for MihoyoPlatform {
                 file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
                 md5ctx.consume(&buf[..n]);
                 downloaded += n as u64;
+
+                //限速 Sleep 逻辑（通过让出 CPU 时间片防止 100% 占用）
+                if limit_bps > 0 {
+                    let expected_duration = Duration::from_secs_f64(n as f64 / limit_bps as f64);
+                    let elapsed = loop_start.elapsed();
+                    if expected_duration > elapsed {
+                        std::thread::sleep(expected_duration - elapsed);
+                    }
+                }
+
                 if last_emit.elapsed() > Duration::from_millis(500) {
-                    let _ = app.emit("download-progress", DownloadProgress { game_id: game_id.into(), downloaded, total, status: "downloading".into() });
-                    last_emit = Instant::now();
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_emit);
+                    if elapsed >= Duration::from_millis(500) {
+                        // 计算瞬时速度 (B/s)
+                        let speed = if elapsed.as_secs_f64() > 0.0 {
+                            ((downloaded - last_emit_downloaded) as f64 / elapsed.as_secs_f64()) as u64
+                        } else { 0 };
+                        // 计算 ETA
+                        let eta_seconds = if speed > 0 { 
+                            Some((total.saturating_sub(downloaded)) / speed) 
+                        } else { None };
+
+                        let _ = app.emit("download-progress", DownloadProgress { 
+                            game_id: game_id.into(), downloaded, total, speed, eta_seconds, status: "downloading".into() 
+                        });
+                        last_emit = now;
+                        last_emit_downloaded = downloaded;
+                    }
                 }
             }
             let digest = format!("{:x}", md5ctx.compute());
@@ -345,7 +383,26 @@ impl GamePlatform for MihoyoPlatform {
             saved.push(out_path);
         }
         println!("[download] 完成：{} 个分卷已落盘 → {}", saved.len(), dest);
-        let _ = app.emit("download-progress", DownloadProgress { game_id: game_id.into(), downloaded, total, status: format!("done:{}", dest) });
+        // 差分包是 .7z：下完即解压并侦察内层结构（合成所需的最后一块情报）
+        if use_patch {
+            for f in &saved {
+                if f.extension().map(|e| e == "7z").unwrap_or(false) {
+                    let extract_dir = out_dir.join("extracted");
+                    std::fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
+                    sevenz_rust::decompress_file(f, &extract_dir)
+                        .map_err(|e| format!("7z 解压失败: {}", e))?;
+                    println!("[patch] 已解压 {} → {}", f.display(), extract_dir.display());
+                    if let Ok(rd) = std::fs::read_dir(&extract_dir) {
+                        for e in rd.filter_map(|e| e.ok()) {
+                            println!("[patch] 结构: {} ({})",
+                                e.file_name().to_string_lossy(),
+                                if e.path().is_dir() { "dir" } else { "file" });
+                        }
+                    }
+                }
+            }
+        }
+        let _ = app.emit("download-progress", DownloadProgress { game_id: game_id.into(), downloaded, total, speed: 0, eta_seconds: Some(0), status: format!("done:{}", dest) });
         Ok(format!("{} 个分卷已下载到 {}", saved.len(), dest))
     }
 }

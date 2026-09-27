@@ -1,4 +1,6 @@
 {
   "launcher_id": "jGHBHlcOq1",
-  "download_limit_mb": 0
+  "download_limit_mb": 0,
+  "download_buffer_mb": 4,
+  "download_speed_limit_mbps": 10
 }

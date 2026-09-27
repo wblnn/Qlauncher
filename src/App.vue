@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
-import { webviewWindow } from '@tauri-apps/api'
+
 
 const games = ref([])
 const loading = ref(false)
@@ -19,6 +19,22 @@ function fmtBytes(n) {
   let i = 0, v = n
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
   return v.toFixed(1) + ' ' + units[i]
+}
+
+function fmtSpeed(bps) {
+  if (!bps) return '0 B/s'
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
+  let i = 0, v = bps
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return v.toFixed(1) + ' ' + units[i]
+}
+
+function fmtEta(sec) {
+  if (sec === null || sec === undefined) return '计算中'
+  if (sec === 0) return '即将完成'
+  if (sec < 60) return sec + 's'
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's'
+  return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm'
 }
 
 function pct(gameId) {
@@ -204,9 +220,13 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               <button v-if="progress[game.id]" class="action-btn mini cancel" @click.stop="cancelDownload(game.id)">✖ 取消</button>
             </template>
           </div>
-          <div v-if="progress[game.id]" class="progress-wrap">
-            <div class="progress-bar"><div class="progress-fill" :style="{ width: pct(game.id) + '%' }"></div></div>
-            <span class="progress-text">{{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}</span>
+          <div v-if="progress[game.id]" class="progress-wrap">           
+            <div class="progress-stats">
+              <span class="size">{{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}</span>
+              <div class="progress-bar"><div class="progress-fill" :style="{ width: pct(game.id) + '%' }"></div></div>
+              <span class="speed">⚡ {{ fmtSpeed(progress[game.id].speed) }}</span>
+              <span class="eta">⏳ {{ fmtEta(progress[game.id].eta_seconds) }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -243,8 +263,10 @@ h1 { color: #4a9eff; margin: 0 0 10px 0; }
 .action-btn.cancel { background: #c62828; color: #fff; }
 .action-btn.official { background: #455a64; }
 .action-btn.web { background: #6a4c93; }
-.progress-wrap { width: 100%; display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-.progress-bar { flex: 1; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
+.progress-wrap { width: 100%; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.progress-bar { width: 30%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
 .progress-fill { height: 100%; background: #4caf50; transition: width 0.3s; }
-.progress-text { font-size: 12px; color: #aaa; min-width: 140px; text-align: right; }
+.progress-stats { display: flex; justify-content: space-between; font-size: 12px; color: #aaa; width: 100%; }
+.progress-stats .speed { color: #4a9eff; font-weight: bold; }
+.progress-stats .eta { color: #ffb74d; }
 </style>
