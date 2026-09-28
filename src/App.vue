@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -11,6 +11,13 @@ const runningGames = ref({})
 const remotes = ref({})
 const progress = ref({})
 const officialInfo = ref({})
+const patchProgress = ref({})
+const zombies = ref([])
+const zombieScanned = ref(false)
+const patchState = ref({})
+const patchBusy = ref('')
+const patchBusyStart = ref(0)
+const nowTick = ref(Date.now())
 let timer = null
 
 function fmtBytes(n) {
@@ -37,6 +44,24 @@ function fmtEta(sec) {
   return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm'
 }
 
+const STEP_ORDER = ['preflight', 'synthesize', 'replace', 'delete', 'verify', 'commit']
+const curPhase = computed(() => (patchState.value[patchBusy.value] || {}).phase || '')
+
+function stepLabel(s) {
+  return { preflight: '预检', synthesize: '合成', replace: '替换', delete: '删除', verify: '校验', commit: '提交' }[s] || s
+}
+function stepDone(s) {
+  const st = patchState.value[patchBusy.value]
+  if (!st) return false
+  const cur = st.phase === 'done' ? 'commit' : st.phase
+  const i = STEP_ORDER.indexOf(cur), j = STEP_ORDER.indexOf(s)
+  return i > -1 && j > -1 && j < i
+}
+function fmtElapsed() {
+  const s = Math.max(0, Math.floor((nowTick.value - patchBusyStart.value) / 1000))
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's'
+}
+
 function pct(gameId) {
   const p = progress.value[gameId]
   if (!p || !p.total) return 0
@@ -54,6 +79,7 @@ function canDownload(game) {
 function downloadLabel(game) {
   const r = remotes.value[game.id]
   if (!r) return '⬇ 下载'
+  if (r.version_relation === 'announced') return `⬇ 旧版整包 v${r.latest_version}`
   if (r.version_relation === 'ahead' && r.patch_from && r.patch_from === game.local_version) {
     return `⬇ 差分 ${fmtBytes(r.patch_size)}`
   }
@@ -63,9 +89,11 @@ function downloadLabel(game) {
 function relationTip(game) {
   const r = remotes.value[game.id]
   if (!r) return ''
-  if (r.version_relation === 'equal') return '｜✅ 已是最新'
-  if (r.version_relation === 'behind') return `｜⚠️ 接口整包滞后(本地 v${r.local_version} 更新)，禁下载`
-  return ''
+  const at = r.checked_at ? `（检查于 ${new Date(r.checked_at * 1000).toLocaleTimeString().slice(0, 5)}·来源 ${r.version_source || '整包'}）` : ''
+  if (r.version_relation === 'equal') return '｜✅ 已是最新' + at
+  if (r.version_relation === 'behind') return `｜⚠️ 接口整包滞后(本地 v${r.local_version} 更新)，禁下载` + at
+  if (r.version_relation === 'announced') return `｜⚠️ 官宣 v${r.announced_version}（推断），接口整包只到 v${r.latest_version} → 请用『🩺 官方更新』` + at
+  return at
 }
 
 async function loadGames() {
@@ -80,6 +108,7 @@ async function loadGames() {
       status: g.installed ? '已安装' : '未安装'
     }))]
     await loadOfficialInfo()
+    await loadPatchState()
   } catch (error) {
     console.error('后端调用失败:', error)
   }
@@ -88,6 +117,14 @@ async function loadGames() {
 
 async function updateRunningStatus() {
   try { runningGames.value = await invoke('get_running_games') } catch (e) {}
+  nowTick.value = Date.now()
+  // 更新进行中：顺便刷新 journal，让阶段指示器实时走（patch_status 很轻，且已在线程池执行）
+  if (patchBusy.value) {
+    try {
+      const st = await invoke('patch_status', { gameId: patchBusy.value })
+      if (st) patchState.value[patchBusy.value] = st
+    } catch (e) {}
+  }
 }
 
 async function launchGame(gameId, useOfficial = false) {
@@ -121,19 +158,26 @@ async function probeApi() {
   } catch (e) { alert('自检失败: ' + e) }
 }
 
-async function startDownload(gameId) {
+async function startDownload(gameId, forceFull = false) {
   const dest = await open({ directory: true, multiple: false, title: '选择下载保存目录' })
   if (!dest) return
   const game = games.value.find(g => g.id === gameId)
   const r = remotes.value[gameId]
-  const isPatch = r && r.patch_from && r.patch_from === game?.local_version
-  const warn = isPatch
-    ? `差分更新约 ${fmtBytes(r.patch_size)}，确认开始？`
-    : `整包下载约 ${fmtBytes(r?.package_size || 0)}，确认硬盘空间足够！`
-  if (!confirm(warn)) return
+  const isPatch = !forceFull && r && r.patch_from && r.patch_from === game?.local_version
+  let allowOld = false
+  if (r && r.version_relation === 'announced' && !forceFull) {
+    // 官宣有新版但整包停更：默认劝退，给一次"我就要旧版"的二次确认
+    if (!confirm(`⚠️ 官方已发布 v${r.announced_version}（来源：${r.version_source}），但接口整包只到 v${r.latest_version}。\n\n继续只会下载【旧版 v${r.latest_version}】，不会让你变成 v${r.announced_version}。\n要更新到最新版请用『🩺 官方更新』（拉起官方启动器）。\n\n仍要下载旧版整包吗？`)) return
+    allowOld = true
+  } else {
+    const warn = isPatch
+      ? `差分更新：下载约 ${fmtBytes(r.patch_size)}（另需临时空间解压），确认开始？`
+      : `整包安装：下载约 ${fmtBytes(r?.package_size || 0)}，解压后安装约 ${fmtBytes(r?.install_size || 0)}。\n\n⚠️ 目标盘需要同时容纳两者（约 ${fmtBytes((r?.package_size || 0) + (r?.install_size || 0))}），确认继续？`
+    if (!confirm(warn)) return
+  }
   try {
     progress.value[gameId] = { downloaded: 0, total: isPatch ? (r?.patch_size || 0) : (r?.package_size || 0), status: 'downloading' }
-    await invoke('start_download', { gameId, dest, usePatch: isPatch })
+    await invoke('start_download', { gameId, dest, usePatch: isPatch, allowOld })
   } catch (e) { delete progress.value[gameId]; alert('启动下载失败: ' + e) }
 }
 
@@ -147,13 +191,35 @@ onMounted(() => {
   timer = setInterval(updateRunningStatus, 2000)
   listen('download-progress', (event) => {
     const p = event.payload
-    if (p.status === 'downloading') progress.value[p.game_id] = p
+    if (p.status === 'downloading' || p.status === 'repairing' || p.status === 'verifying' || p.status === 'extracting') progress.value[p.game_id] = p
     else if (p.status.startsWith('done_test:')) {
       delete progress.value[p.game_id]
       alert('🧪 保命线生效！已安全截断，硬盘安全。文件在：' + p.status.slice(10))
     }
     else if (p.status.startsWith('done:')) { delete progress.value[p.game_id]; alert('下载完成：' + p.status.slice(5)) }
     else { delete progress.value[p.game_id]; alert('下载结束：' + p.status.replace('error:', '')) }
+  })
+  listen('patch-progress', (event) => {
+    const p = event.payload
+    if (p.status === 'patching') {
+      patchProgress.value[p.game_id] = p.current || `${p.done}/${p.total}`
+    } else if (p.status.startsWith('done:')) {
+      patchProgress.value[p.game_id] = ''
+      delete progress.value[p.game_id]
+      patchBusy.value = ''
+      alert('完成：' + p.status.slice(5))
+      loadGames()
+    } else if (p.status.startsWith('error:')) {
+      patchProgress.value[p.game_id] = ''
+      delete progress.value[p.game_id]
+      patchBusy.value = ''
+      alert('失败：' + p.status.slice(6))
+      loadPatchState()
+    }
+  })
+  listen('verify-progress', (event) => {
+    const p = event.payload
+    patchProgress.value[p.game_id] = `${p.done}/${p.total} ${p.current}`
   })
 })
 
@@ -173,13 +239,119 @@ async function openOfficial(gameId, mode) {
 async function applyPatch(gameId) {
   const dir = await open({ directory: true, multiple: false, title: '选择差分包目录 (patch_x_y)' })
   if (!dir) return
+  patchBusy.value = gameId
+  patchBusyStart.value = Date.now()
+  patchProgress.value[gameId] = '预检：进程占用 / 文件可写性 / 磁盘空间…'
   try {
     const plan = await invoke('apply_patch', { gameId, patchDir: dir, dryRun: true })
-    if (!confirm('预演计划:\n' + plan + '\n\n确认执行真实合成？\n(原地升级，不可回滚；失败可用官启"修复")')) return
-    const msg = await invoke('apply_patch', { gameId, patchDir: dir, dryRun: false })
-    alert(msg)
+    if (!confirm('预演计划:\n' + plan + '\n\n确认执行真实合成？\n(可逆：提交点之前都能「▶ 继续更新」或「↩ 回滚」)')) {
+      patchBusy.value = ''
+      delete patchProgress.value[gameId]
+      await loadPatchState()
+      return
+    }
+    alert(await invoke('apply_patch', { gameId, patchDir: dir, dryRun: false }))
+  } catch (e) {
+    alert('应用差分失败: ' + e)
+    patchBusy.value = ''
+    delete patchProgress.value[gameId]
+    await loadPatchState()
+  }
+}
+
+async function killGame(gameId) {
+  try {
+    const msg = await invoke('kill_game', { gameId })
+    console.log(msg)
+    // 杀掉后立刻刷新一次状态，不用等 2 秒心跳
+    await updateRunningStatus()
+  } catch (e) {
+    alert('关闭失败: ' + e)
+  }
+}
+
+async function scanZombies() {
+  try {
+    zombies.value = await invoke('list_zombie_games')
+    zombieScanned.value = true
+  } catch (e) { alert('扫描失败: ' + e) }
+}
+
+async function killZombie(pid) {
+  try {
+    console.log(await invoke('kill_process', { pid }))
+    await scanZombies() // 刷新一遍，看它消失
+  } catch (e) { alert('杀死僵尸进程失败: ' + e) }
+}
+
+// ===== 更新应变：继续 / 回滚 / 兜底 =====
+async function loadPatchState() {
+  const ids = games.value.filter(g => g.id !== 'test_notepad').map(g => g.id)
+  const res = await Promise.all(ids.map(id => invoke('patch_status', { gameId: id }).catch(() => null)))
+  ids.forEach((id, i) => { if (res[i]) patchState.value[id] = res[i]; else delete patchState.value[id] })
+}
+
+async function resumePatch(gameId) {
+  if (!confirm('继续上次未完成的更新？\n从断点接着做，已完成的部分会自动跳过。')) return
+  patchBusy.value = gameId
+  patchBusyStart.value = Date.now()
+  try { alert(await invoke('resume_patch', { gameId })) } catch (e) { patchBusy.value = ''; alert('继续失败: ' + e) }
+}
+
+async function rollbackPatch(gameId) {
+  const st = patchState.value[gameId] || {}
+  if (!confirm(`回滚到 ${st.from_version || '补丁前状态'}？\n会还原已改动的文件、删掉本次新增的文件、复原 config.ini。`)) return
+  try {
+    alert(await invoke('rollback_patch', { gameId }))
+    await loadPatchState()
     await loadGames()
-  } catch (e) { alert('应用差分失败: ' + e) }
+  } catch (e) { alert('回滚失败: ' + e) }
+}
+
+// ===== 🩹 校验修复：删/坏了几个文件时只补这几个，不用重下整包 =====
+async function verifyRepair(gameId) {
+  // 确定 = 快速（只比大小）；取消 = 深度（逐文件算 md5，慢但能发现"大小对但内容坏"）
+  const deep = !confirm('校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
+  patchBusy.value = gameId
+  patchBusyStart.value = Date.now()
+  patchProgress.value[gameId] = deep ? '深度校验：逐文件算 md5…' : '快速校验：比对文件大小…'
+  progress.value[gameId] = { downloaded: 0, total: 0, speed: 0, eta_seconds: null, status: 'verifying' }
+  try {
+    const r = await invoke('verify_game_files', { gameId, deep })
+    patchBusy.value = ''
+    delete patchProgress.value[gameId]
+    delete progress.value[gameId]
+    const head = `清单来源：${r.manifest}\n共 ${r.total} 项 → 正常 ${r.ok} ｜ 缺失 ${r.missing} ｜ 大小不符 ${r.size_bad} ｜ md5 不符 ${r.md5_bad}\n` +
+      `需要补下：${fmtBytes(r.broken_bytes)}\n本地 v${r.local_version} ｜ 接口 v${r.remote_version} ｜ 版本${r.version_match ? '一致 ✅' : '不一致 ⚠️'}\n` +
+      `散列地址：${r.res_list_url || '（无 → 无法单文件补全）'}`
+    const list = r.sample.length ? `\n\n前 ${r.sample.length} 条：\n` + r.sample.join('\n') : ''
+    const broken = r.missing + r.size_bad + r.md5_bad
+    if (broken === 0) { alert(head + '\n\n✅ 没有发现问题文件。'); return }
+    if (!r.res_list_url) { alert(head + list + '\n\n⚠️ 该版本没有散列文件地址，无法按单文件补全 —— 请用『🩺 官方修复』或整包。'); return }
+    if (!r.version_match) { alert(head + list + '\n\n⚠️ 本地版本与接口整包版本不一致：单文件地址指向接口那个版本，直接补可能把文件搞乱，已阻止。\n→ 先用官方启动器对齐版本，或走整包。'); return }
+    if (!confirm(head + list + `\n\n确认按清单【只补这 ${broken} 个文件】？`)) return
+    patchBusy.value = gameId
+    patchBusyStart.value = Date.now()
+    alert(await invoke('repair_game_files', { gameId }))
+  } catch (e) {
+    patchBusy.value = ''
+    delete patchProgress.value[gameId]
+    alert('校验/修复失败: ' + e)
+  }
+}
+
+// 兜底 L3：拉起官方启动器去「修复」
+async function officialRepair(gameId) {
+  try {
+    alert(await invoke('open_official', { gameId, mode: 'auto' }) +
+      '\n\n→ 在官方启动器里对该游戏点「修复」/「更新」，它会按官方清单校验并补齐缺失文件。')
+  } catch (e) { alert('拉起官方启动器失败: ' + e) }
+}
+
+// 兜底 L4：整包下载到新目录（不碰当前这份可能已损坏的安装）
+async function downloadFull(gameId) {
+  if (!confirm('把【完整整包】下载到一个新目录？\n不会改动当前安装；下完后可用官方启动器的「添加已有游戏」指向新目录。')) return
+  await startDownload(gameId, true)
 }
 
 onUnmounted(() => { if (timer) clearInterval(timer) })
@@ -190,8 +362,42 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
     <header>
       <h1>🎮 模块化游戏聚合器 (L0-L3)</h1>
       <button class="action-btn mini info" @click="probeApi">🔬 API 自检</button>
-      
+      <button class="action-btn mini" @click="scanZombies">🧟 僵尸扫描</button>
     </header>
+    <div v-if="zombies.length" class="zombie-panel">
+      <h4>🧟 检测到 {{ zombies.length }} 个残留进程（已死但占坑）</h4>
+      <div v-for="z in zombies" :key="z.pid" class="zombie-row">
+        <span>{{ z.game_id }} · PID {{ z.pid }} · 工作集 {{ fmtBytes(z.memory) }}</span>
+        <button class="action-btn mini cancel" @click="killZombie(z.pid)">清理</button>
+      </div>
+    </div>
+    <div v-else-if="zombieScanned" class="zombie-panel">✅ 干净，无残留进程</div>
+    <div v-if="Object.keys(patchState).length" class="patch-panel">
+      <h4>⚠️ 有未完成的更新（可续跑 / 可回滚）</h4>
+      <div v-for="(st, gid) in patchState" :key="gid" class="patch-row">
+        <span>
+          <b>{{ gid }}</b> · 阶段 {{ st.phase }} · 合成 {{ st.diff_done }}/{{ st.diff_total }} · 替换 {{ st.replace_done }}/{{ st.replace_total }}
+          · 已备份 {{ (st.backups || []).length }} 个<template v-if="st.from_version"> （{{ st.from_version }} → {{ st.to_version }}）</template>
+          <template v-if="st.message"><br><span class="patch-msg">{{ st.message }}</span></template>
+        </span>
+        <span class="patch-actions">
+          <button class="action-btn mini dl" @click="resumePatch(gid)">▶ 继续更新</button>
+          <button class="action-btn mini cancel" @click="rollbackPatch(gid)">↩ 回滚</button>
+          <button class="action-btn mini official" @click="officialRepair(gid)">🩺 官方修复</button>
+          <button class="action-btn mini" @click="downloadFull(gid)">⬇ 整包到新目录</button>
+        </span>
+      </div>
+      <div class="patch-note">顺序：继续 → 回滚 → 官方修复 → 整包到新目录。续跑和回滚都只依赖本地已下好的补丁与备份，不需要重新下载。</div>
+    </div>
+    <div v-if="patchBusy" class="run-panel">
+      <h4>🔧 正在更新 <b>{{ patchBusy }}</b> · 已用 {{ fmtElapsed() }}</h4>
+      <div class="steps">
+        <span v-for="s in STEP_ORDER" :key="s" class="step"
+              :class="{ on: curPhase === s, done: stepDone(s) }">{{ stepLabel(s) }}</span>
+      </div>
+      <div class="run-current">{{ patchProgress[patchBusy] || '准备中…' }}</div>
+      <div class="run-hint">任务在后台线程执行，窗口不会卡；可以最小化。中途关掉程序也不要紧 —— 重启后可用『▶ 继续更新』或『↩ 回滚』兜住。</div>
+    </div>
     <main>
       <div v-if="loading">加载中...</div>
       <div v-else class="game-list">
@@ -207,7 +413,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               </span>
               {{ game.status }}
               <template v-if="game.local_version">｜本地 v{{ game.local_version }}</template>
-              <template v-if="remotes[game.id]">｜远程 v{{ remotes[game.id].latest_version }}</template>
+              <template v-if="remotes[game.id]">｜远程 v{{ remotes[game.id].latest_version }}<template v-if="remotes[game.id].announced_version && remotes[game.id].announced_version !== remotes[game.id].latest_version">｜官宣 v{{ remotes[game.id].announced_version }}（推断）</template></template>
               <span class="tip">{{ relationTip(game) }}</span>
             </span>
           </div>
@@ -223,27 +429,37 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               <button class="action-btn l1" @click.stop="launchGame(game.id, false)">▶ 直启 (协议)</button>
             </template>
             <template v-if="game.platform_level === 'Full' || game.platform_level === 'Download'">
-              <button v-if="game.status === '已安装'" class="action-btn l3" :disabled="runningGames[game.id]" @click.stop="launchGame(game.id, false)">
-                {{ runningGames[game.id] ? '运行中...' : '▶ 启动' }}
-              </button>
+              <template v-if="game.status === '已安装'">
+                <!-- 正在运行时：显示红色的强制关闭按钮 -->
+                <button v-if="runningGames[game.id]" class="action-btn kill" @click.stop="killGame(game.id)">
+                  ⏹ 强制关闭
+                </button>
+                <!-- 未运行时：显示正常的启动按钮 -->
+                <button v-else class="action-btn l3" @click.stop="launchGame(game.id, false)">
+                  ▶ 启动
+                </button>
+              </template>
               <button v-else class="action-btn bind" @click.stop="bindGame(game.id)">📁 绑定目录</button>
               <button v-if="game.id !== 'test_notepad'" class="action-btn mini info" @click.stop="checkRemote(game.id)">📡 查版本</button>
               <button v-if="canDownload(game) && !progress[game.id]" class="action-btn mini dl" @click.stop="startDownload(game.id)">{{ downloadLabel(game) }}</button>
               <button v-if="progress[game.id]" class="action-btn mini cancel" @click.stop="cancelDownload(game.id)">✖ 取消</button>
               <button v-if="game.status === '已安装' && game.platform === 'mihoyo'" class="action-btn mini" @click.stop="applyPatch(game.id)">🔧 应用差分</button>
+              <button v-if="game.status === '已安装' && game.platform === 'mihoyo'" class="action-btn mini" @click.stop="verifyRepair(game.id)">🩹 校验修复</button>
             </template>
           </div>
           <div v-if="progress[game.id]" class="progress-wrap">           
             <div class="progress-stats">
-              <span class="size">{{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}</span>
+              <span class="size">{{ progress[game.id].status === 'extracting' ? '📦 解压中 ' : '' }}{{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}（{{ pct(game.id).toFixed(1) }}%）</span>
               <div class="progress-bar"><div class="progress-fill" :style="{ width: pct(game.id) + '%' }"></div></div>
               <span class="speed">⚡ {{ fmtSpeed(progress[game.id].speed) }}</span>
               <span class="eta">⏳ {{ fmtEta(progress[game.id].eta_seconds) }}</span>
             </div>
           </div>
+          <div v-if="patchProgress[game.id]" class="patch-progress">🔧 {{ patchProgress[game.id] }}</div>
         </div>
       </div>
     </main>
+
   </div>
 </template>
 
@@ -276,10 +492,30 @@ h1 { color: #4a9eff; margin: 0 0 10px 0; }
 .action-btn.cancel { background: #c62828; color: #fff; }
 .action-btn.official { background: #455a64; }
 .action-btn.web { background: #6a4c93; }
+.action-btn.kill { background: #d32f2f; }
+.action-btn.kill:hover { background: #b71c1c; }
 .progress-wrap { width: 100%; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
-.progress-bar { width: 30%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
+.progress-bar { width: 45%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
 .progress-fill { height: 100%; background: #4caf50; transition: width 0.3s; }
 .progress-stats { display: flex; justify-content: space-between; font-size: 12px; color: #aaa; width: 100%; }
 .progress-stats .speed { color: #4a9eff; font-weight: bold; }
 .progress-stats .eta { color: #ffb74d; }
+.zombie-panel { background: #2a1a1a; border: 1px solid #c62828; border-radius: 8px; padding: 12px; margin-bottom: 20px; }
+.zombie-panel h4 { margin: 0 0 10px 0; color: #ff8a80; font-size: 14px; }
+.zombie-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-top: 1px dashed #553333; font-size: 13px; color: #ddd; }
+.patch-panel { background: #2a2418; border: 1px solid #ffb74d; border-radius: 8px; padding: 12px; margin-bottom: 20px; }
+.patch-panel h4 { margin: 0 0 10px 0; color: #ffb74d; font-size: 14px; }
+.patch-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px dashed #554433; font-size: 13px; color: #ddd; flex-wrap: wrap; }
+.patch-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.patch-msg { color: #ff8a80; font-size: 12px; }
+.patch-note { margin-top: 10px; font-size: 12px; color: #999; }
+.patch-progress { margin-top: 8px; font-size: 12px; color: #ffb74d; }
+.run-panel { background: #182430; border: 1px solid #4a9eff; border-radius: 8px; padding: 12px; margin-bottom: 20px; }
+.run-panel h4 { margin: 0 0 10px 0; color: #4a9eff; font-size: 14px; }
+.steps { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.step { padding: 3px 8px; border-radius: 10px; font-size: 12px; background: #24333f; color: #8899a6; }
+.step.done { background: #2e7d32; color: #fff; }
+.step.on { background: #4a9eff; color: #fff; font-weight: bold; }
+.run-current { font-size: 12px; color: #ddd; word-break: break-all; }
+.run-hint { margin-top: 8px; font-size: 12px; color: #999; }
 </style>

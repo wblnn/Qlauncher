@@ -3,5 +3,12 @@
   "download_limit_mb": 0,
   "download_buffer_mb": 4,
   "download_speed_limit_mbps": 10,
-  "hpatchz_path": "F:/6/Qlauncher/src-tauri/hpatchz.exe"
+  "hpatchz_path": "F:/6/Qlauncher/src-tauri/hpatchz.exe",
+  "keep_volumes_after_extract": true,
+  "launcher_ids": ["jGHBHlcOq1"],
+  "biz_patterns": {
+    "genshin": ["hk4e", "原神"],
+    "starrail": ["hkrpg", "星穹铁道"],
+    "zenless": ["nap", "绝区零"]
+  }
 }
