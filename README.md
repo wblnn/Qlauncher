@@ -1,144 +1,144 @@
 # qlauncher
 
-A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 + TypeScript**. It unifies multiple distribution platforms (miHoYo, Steam, Riot) behind a single interface: it auto-scans your machine for installed games, checks remote versions, supports full & differential downloads with speed and memory-usage controls, and launches games with one click.
+一个基于 **Tauri 2 + Vue 3 + TypeScript** 的跨平台游戏启动器 / 下载管理器。它把多个发行平台（米哈游、Steam、Riot）统一成一个界面：自动扫描本机已安装的游戏，检查远程版本，支持整包与差分下载、限速与内存占用控制，并一键启动游戏。
 
-> The backend currently relies heavily on the Windows registry (`winreg`); it is primarily developed and verified on **Windows**.
+> 当前后端大量依赖 Windows 注册表（`winreg`），主要在 **Windows** 上开发与验证。
 
-📖 Chinese documentation: [README.zh-CN.md](./README.zh-CN.md)
+📖 English documentation: [README.en.md](./README.en.md)
 
-## Features
+## 功能特性
 
-- **Multi-platform aggregation**: each platform is abstracted behind a unified `GamePlatform` trait, with capability tiers:
-  - `Aggregate` (entry point only, e.g. Riot)
-  - `DirectLaunch` (can be launched directly, e.g. Steam)
-  - `Download` / `Full` (version check + download + launch, e.g. miHoYo)
-- **Installed-game scanning**: reads the Windows uninstall registry keys plus per-platform directory rules to detect install paths, executables and local version numbers
-- **Manual binding**: when the registry scan comes up empty, bind a game directory manually via a folder-picker dialog
-- **Version guard (P0)**: semantic version comparison — downloads are only allowed when the state is `fresh` (not installed) or `ahead` (remote has an update); if the API's package lags behind the local version it is marked `behind` and downloading is blocked, preventing "updates that make your game older"
-- **Full / differential downloads**: patches are preferred (with patch size shown), falling back to full packages; multi-part packages (`parts`) are supported
-- **Download UX**: real-time progress events (downloaded / total / speed / ETA), cancel support, streaming buffering with a disk-usage safety line (`download_limit_mb`), optional download speed limit
-- **Running-state detection**: polls processes via `sysinfo`, distinguishing "running / installed / not installed" in the UI
-- **Official entry points**: open the official website or invoke the official launcher (`launcher_uri`) with one click
-- **API self-diagnosis**: built-in 🔬 self-check command printing HYP API connectivity, `launcher_id` source and package-parsing results to help debug broken APIs
+- **多平台聚合**：以统一的 `GamePlatform` trait 抽象各平台能力，按能力分级展示
+  - `Aggregate`（仅聚合入口，如 Riot）
+  - `DirectLaunch`（可直接启动，如 Steam）
+  - `Download` / `Full`（可查版本 + 下载 + 启动，如米哈游）
+- **已安装游戏扫描**：读取 Windows 卸载注册表项 + 平台自有目录规则，识别安装路径、exe 与本地版本号
+- **手动绑定**：注册表扫不到时，可通过目录选择对话框手动绑定游戏目录
+- **版本守卫（P0）**：语义化版本比较，只有 `fresh`（未安装）或 `ahead`（远程有更新）才允许下载；接口整包滞后于本地版本时标记 `behind` 并禁止下载，避免"越更新越旧"
+- **整包 / 差分下载**：优先使用差分包（显示差分体积），无差分则回退整包；支持分卷包（`parts`）
+- **下载体验**：实时进度事件（已下载 / 总量 / 速度 / ETA）、取消下载、流式缓冲与磁盘占用保护线（`download_limit_mb`）、可选下载限速
+- **运行状态检测**：基于 `sysinfo` 轮询进程，界面上区分"运行中 / 已安装 / 未安装"
+- **官方入口**：一键打开游戏官网或唤起官方启动器（`launcher_uri`）
+- **接口自检**：内置 🔬 自检命令，输出 HYP 接口连通性、`launcher_id` 来源、包信息解析结果，便于排查接口失效问题
 
-## Tech Stack
+## 技术栈
 
-| Layer | Technology |
+| 层 | 技术 |
 | --- | --- |
-| Frontend | Vue 3 `<script setup>`, TypeScript, Vite |
-| Desktop framework | Tauri 2 (`@tauri-apps/api` v2) |
-| Plugins | `tauri-plugin-dialog` (folder picker), `tauri-plugin-opener` (open links / programs) |
-| Backend (Rust) | `reqwest` (HTTP), `md5` (checksums), `sevenz-rust` (7z extraction), `sysinfo` (processes), `winreg` (registry) |
+| 前端 | Vue 3 `<script setup>`、TypeScript、Vite |
+| 桌面框架 | Tauri 2（`@tauri-apps/api` v2） |
+| 插件 | `tauri-plugin-dialog`（目录选择）、`tauri-plugin-opener`（打开链接/程序） |
+| 后端 | Rust：`reqwest`（HTTP）、`md5`（校验）、`sevenz-rust`（7z 解压）、`sysinfo`（进程）、`winreg`（注册表） |
 
-## Prerequisites
+## 环境要求
 
-- Node.js 18+ (20+ recommended) and npm
-- Rust toolchain (stable) + Tauri 2 prerequisites, see the [official guide](https://tauri.app/start/prerequisites/)
-- Windows: WebView2 Runtime and MSVC build tools
-- Recommended IDE: VS Code + Volar (Vue - Official), tauri-vscode, rust-analyzer (this repo ships with `.vscode` config)
+- Node.js 18+（建议 20+）与 npm
+- Rust 工具链（stable）+ Tauri 2 前置依赖，参见 [Tauri 官方指南](https://tauri.app/start/prerequisites/)
+- Windows：WebView2 Runtime、MSVC 生成工具
+- 推荐 IDE：VS Code + Volar（Vue - Official）、tauri-vscode、rust-analyzer（仓库已带 `.vscode` 配置）
 
-## Quick Start
+## 快速开始
 
 ```bash
-# Install dependencies
+# 安装依赖
 npm install
 
-# Dev mode (starts the Vite dev server and the Tauri window together)
+# 开发模式（同时启动 Vite dev server 与 Tauri 窗口）
 npm run tauri dev
 
-# Frontend only (http://localhost:1420)
+# 仅前端（http://localhost:1420）
 npm run dev
 
-# Type check + frontend build
+# 类型检查 + 前端构建
 npm run build
 
-# Build installer packages (targets = all: msi / exe / nsis, etc.)
+# 打包安装包（targets = all：msi / exe / nsis 等）
 npm run tauri build
 ```
 
-Vite uses a fixed port `1420` (`strictPort`) and ignores file watching under `src-tauri/`; for physical-device / remote HMR, set the `TAURI_DEV_HOST` environment variable.
+Vite 固定端口 `1420`（`strictPort`），并忽略对 `src-tauri/` 的文件监听；如需真机 / 远程 HMR，设置环境变量 `TAURI_DEV_HOST`。
 
-## Project Structure
+## 项目结构
 
 ```
 .
-├── index.html                # Frontend entry
-├── vite.config.ts            # Vite + Tauri dev config (port 1420 / HMR)
-├── src/                      # Vue frontend
-│   ├── main.ts               # App bootstrap
-│   └── App.vue               # Main UI: game list, version comparison, download progress, buttons
-├── src-tauri/                # Rust backend
-│   ├── tauri.conf.json       # Tauri config (window, bundle, commands)
-│   ├── channels.json         # Runtime config: launcher_id, download buffer / speed limit / usage cap
-│   ├── capabilities/default.json  # Permission declarations (core / opener / dialog)
+├── index.html                # 前端入口
+├── vite.config.ts            # Vite + Tauri 开发配置（端口 1420 / HMR）
+├── src/                      # Vue 前端
+│   ├── main.ts               # 应用挂载
+│   └── App.vue               # 主界面：游戏列表、版本对比、下载进度、按钮交互
+├── src-tauri/                # Rust 后端
+│   ├── tauri.conf.json       # Tauri 配置（窗口、bundle、前后端联动命令）
+│   ├── channels.json         # 运行时配置：launcher_id、下载缓冲/限速/占用上限
+│   ├── capabilities/default.json  # 权限声明（core / opener / dialog）
 │   └── src/
-│       ├── lib.rs            # Tauri command registration, registry scanning, launching & process detection
-│       ├── platform.rs       # Platform abstraction trait & data structures (GameInfo / RemoteGameInfo / DownloadProgress)
+│       ├── lib.rs            # Tauri command 注册、注册表扫描、启动与进程检测
+│       ├── platform.rs       # 平台抽象 trait 与数据结构（GameInfo / RemoteGameInfo / DownloadProgress）
 │       └── platforms/
-│           ├── mod.rs        # Platform registry & game_id → platform routing
-│           ├── mihoyo.rs     # miHoYo HYP API: version check, full/differential download, self-diagnosis
-│           ├── steam.rs      # Steam (direct launch)
-│           └── riot.rs       # Riot (aggregated entry)
-└── public/                   # Static assets
+│           ├── mod.rs        # 平台注册表与 game_id → 平台 路由
+│           ├── mihoyo.rs     # 米哈游 HYP 接口：版本查询、整包/差分下载、自检
+│           ├── steam.rs      # Steam（直接启动）
+│           └── riot.rs       # Riot（聚合入口）
+└── public/                   # 静态资源
 ```
 
-## Configuration (`src-tauri/channels.json`)
+## 配置说明（`src-tauri/channels.json`）
 
 ```jsonc
 {
-  "launcher_id": "jGHBHlcOq1",      // HYP API launcher_id; falls back to the built-in default if empty
-  "download_limit_mb": 0,           // Disk-usage "safety line" for downloads, 0 = unlimited
-  "download_buffer_mb": 4,          // Streaming write buffer size (MB), controls peak memory usage
-  "download_speed_limit_mbps": 10   // Download speed limit (MB/s), 0 = unlimited
+  "launcher_id": "jGHBHlcOq1",      // HYP 接口 launcher_id，留空则回退内置默认值
+  "download_limit_mb": 0,           // 下载磁盘占用"保命线"，0 = 不限制
+  "download_buffer_mb": 4,          // 流式写入缓冲区大小（MB），控制内存峰值
+  "download_speed_limit_mbps": 10   // 下载限速（MB/s），0 = 不限速
 }
 ```
 
-An invalid `launcher_id` causes miHoYo API calls to return `retcode != 0`. In that case, click the 🔬 self-check button in the UI to view the report and replace this field.
+`launcher_id` 失效会导致米哈游接口返回 `retcode != 0`，此时点击界面上的 🔬 自检查看报告，并替换此字段即可。
 
-## Download Pipeline
+## 下载流程细节
 
-1. `check_remote` fetches the version and part list (`parts`: url / md5 / size) and reports the `version_relation`
-2. `start_download` streams each part into the target directory while computing MD5 on the fly; aborts when `download_limit_mb` would be exceeded to protect the disk
-3. Each part is MD5-verified as soon as it finishes writing; on failure the part is deleted and an error is raised to avoid dirty files
-4. Differential packages (`.7z`) are automatically extracted into `extracted/` after download, with the inner structure printed, ready for later merging
-5. Throughout the process, `download-progress` events report progress, speed and ETA
+1. `check_remote` 拉取版本与分卷列表（`parts`：url / md5 / size），并给出 `version_relation`
+2. `start_download` 逐卷流式写入目标目录，边写边算 MD5；超出 `download_limit_mb` 时中止以保护磁盘
+3. 每卷写完即校验 MD5，失败则删除该卷并报错，避免脏文件残留
+4. 差分包（`.7z`）下载完成后自动解压到 `extracted/` 并打印内层结构，为后续合成做准备
+5. 全程通过 `download-progress` 事件回传进度、速度与 ETA
 
-## Supported Games & IDs
+## 支持的游戏与 ID
 
-| game_id | Name | Platform | Capability |
+| game_id | 名称 | 平台 | 能力级别 |
 | --- | --- | --- | --- |
-| `genshin` | Genshin Impact | miHoYo | Full |
-| `starrail` | Honkai: Star Rail | miHoYo | Full |
-| `zenless` | Zenless Zone Zero | miHoYo | Full |
-| `terraria` | Terraria | Steam | DirectLaunch |
+| `genshin` | 原神 | 米哈游 | Full |
+| `starrail` | 崩坏：星穹铁道 | 米哈游 | Full |
+| `zenless` | 绝区零 | 米哈游 | Full |
+| `terraria` | 泰拉瑞亚 | Steam | DirectLaunch |
 | `ravenfield` | Ravenfield | Steam | DirectLaunch |
-| `valorant` | VALORANT | Riot | Aggregate |
-| `test_notepad` | Test: Notepad | — | Full (for integration testing) |
+| `valorant` | 无畏契约 | Riot | Aggregate |
+| `test_notepad` | 测试：记事本 | — | Full（联调用） |
 
-To add a game, simply register its ID in the corresponding platform's `game_ids()` and implement `remote_info` / `download` etc. as needed.
+新增游戏只需在对应平台的 `game_ids()` 中登记 ID，并按需实现 `remote_info` / `download` 等方法。
 
-## Tauri Commands
+## Tauri Command 一览
 
-| Command | Purpose |
+| Command | 作用 |
 | --- | --- |
-| `get_installed_games` | Returns all games detected across platforms with install status |
-| `bind_game(id, dir)` | Manually bind a game directory |
-| `launch_game(id, use_official)` | Launch a game (or invoke the official launcher) |
-| `get_running_games` | Returns whether each game is currently running |
-| `official_info(game_id)` / `open_official(game_id, mode)` | Official-site info / open the official site |
-| `check_remote(game_id)` | Query the latest remote version, package size, patch availability & version relation |
-| `start_download(game_id, dest, use_patch)` | Start a download (full or differential) |
-| `cancel_download(game_id)` | Cancel an in-progress download |
-| `probe_api` | API self-diagnosis, returns an array of report lines |
+| `get_installed_games` | 返回全部平台已扫描到的游戏及安装状态 |
+| `bind_game(id, dir)` | 手动绑定游戏目录 |
+| `launch_game(id, use_official)` | 启动游戏（或唤起官方启动器） |
+| `get_running_games` | 返回各游戏是否正在运行 |
+| `official_info(game_id)` / `open_official(game_id, mode)` | 官网信息与打开官网 |
+| `check_remote(game_id)` | 查询远程最新版本、包体积、差分与版本关系 |
+| `start_download(game_id, dest, use_patch)` | 开始下载（整包或差分） |
+| `cancel_download(game_id)` | 取消进行中的下载 |
+| `probe_api` | 接口自检，返回诊断报告文本数组 |
 
-The frontend listens via `listen("download-progress", ...)` to receive `DownloadProgress` events and update the progress bar, speed and time remaining.
+前端通过 `listen("download-progress", ...)` 接收 `DownloadProgress` 事件更新进度条、速度与剩余时间。
 
-## Known Limitations
+## 已知限制
 
-- Registry scanning and parts of the launch logic are Windows-only; macOS / Linux require additional platform branches in `platform.rs`
-- miHoYo downloads rely on the non-public HYP API; API changes must be mirrored in `mihoyo.rs`
-- There is no one-click post-download install / verification flow yet (extraction and MD5 verification are handled ad hoc inside platform implementations)
+- 注册表扫描与部分启动逻辑为 Windows 专属，macOS / Linux 需补充 `platform.rs` 中的平台分支
+- 米哈游下载依赖非公开 HYP 接口，接口变更需同步更新 `mihoyo.rs`
+- 下载完成后暂不包含自动安装 / 校验落位的一键流程（解压与 MD5 校验在平台实现内按需处理）
 
-## Git Commit Convention
+## Git 提交约定
 
-Commit messages describe the actual change in Chinese, e.g.: `优化了下载占用，完善了一下下载交互`.
+提交信息使用中文描述实际改动，例如：`优化了下载占用，完善了一下下载交互`。
