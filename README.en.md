@@ -139,6 +139,4 @@ The frontend listens via `listen("download-progress", ...)` to receive `Download
 - miHoYo downloads rely on the non-public HYP API; API changes must be mirrored in `mihoyo.rs`
 - There is no one-click post-download install / verification flow yet (extraction and MD5 verification are handled ad hoc inside platform implementations)
 
-## Git Commit Convention
 
-Commit messages describe the actual change in Chinese, e.g.: `优化了下载占用，完善了一下下载交互`.
