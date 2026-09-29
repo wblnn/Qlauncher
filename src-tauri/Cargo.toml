@@ -31,6 +31,9 @@ sevenz-rust = "0.6"
 # 整包自动解压用（两者都已在依赖树里，离线可解析）：flate2 解 zip 的 deflate，crc32fast 校验 CRC
 flate2 = "1"
 crc32fast = "1"
+prost = "0.13"
+zstd = "0.13"
+bytes = "1.7"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

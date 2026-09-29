@@ -1,5 +1,6 @@
 pub mod platform;
 pub mod platforms;
+pub mod sophon;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -410,6 +411,26 @@ fn repair_game_files(app: tauri::AppHandle, game_id: String) -> Result<String, S
     crate::platforms::mihoyo::repair_files(&app, &game_id)
 }
 
+// src-tauri/src/lib.rs
+use sysinfo::Disks;
+
+/// 检查目标路径所在磁盘的可用空间 (单位: MB)
+pub fn check_available_space_mb(path: &Path) -> Result<u64, String> {
+    let mut disks = Disks::new_with_refreshed_list();
+    // 规范化路径为绝对路径，确保能正确匹配挂载点
+    let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    
+    for disk in disks.list() {
+        if abs_path.starts_with(disk.mount_point()) {
+            return Ok(disk.available_space() / 1024 / 1024);
+        }
+    }
+    Err("无法识别目标路径所在磁盘分区".to_string())
+}
+
+// 临时验证命令 v3：build_url 传 "branches" 时自动走 getGameBranches 拿最新构建
+
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -427,3 +448,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+
+

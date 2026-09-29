@@ -1482,10 +1482,9 @@ impl GamePlatform for MihoyoPlatform {
             None => (None, 0, Vec::new()),
         };
 
-        // ③ 公告/预下载推断"当前真实版本"（整包条目停更时，这是唯一能知道有新版的方式）
-        //    ⚠️ 这里失败不再静默：把原因写进 version_source，免得又出现"为什么没有官宣"
+        // ③ 公告/预下载推断"当前真实版本"
         let mut announce_err: Option<String> = None;
-        let announced = match hyp_get::<HypRoot<HypContentData>>(
+        let mut announced = match hyp_get::<HypRoot<HypContentData>>(
                 &hyp_url("getGameContent", &launcher_id, &[("game_id", hyp_game_id.as_str())])) {
             Ok(r) if r.retcode == 0 => match r.data.and_then(|d| d.content).and_then(|c| announced_from_posts(&c.posts)) {
                 Some(v) => Some(v),
@@ -1494,11 +1493,45 @@ impl GamePlatform for MihoyoPlatform {
             Ok(r) => { announce_err = Some(format!("getGameContent retcode={} {}", r.retcode, r.message)); None }
             Err(e) => { announce_err = Some(format!("getGameContent 请求失败: {}", e)); None }
         };
+        
+        // 🌟 显式标注 &str 类型，避免生命周期推断报错
+        let mut announced_src: &str = "公告(推断)";
 
-        // ④ 远程"最新版本" = 整包 / 预下载 / 公告推断 三者取最大，并记录是哪个源给的
+                // 🌟 Sophon 权威版本：原神/星铁直接取 getBuild 的 tag（公告解析失败不再阻断更新）
+        if biz == "hk4e_cn" || biz == "hkrpg_cn" {
+            let biz_clone = biz.clone();
+            
+            // 🌟 修复：使用 std::thread::spawn 避开 tokio worker 线程，防止 reqwest::blocking 引发 panic
+            let tag_result = std::thread::spawn(move || {
+                crate::sophon::fetch_latest_tag(&biz_clone)
+            }).join().unwrap_or(Err("获取 tag 线程异常".into()));
+
+            match tag_result {
+                Ok(tag) => {
+                    let better = announced.as_ref()
+                        .map(|a| compare_versions(&tag, a) == Ordering::Greater)
+                        .unwrap_or(true);
+                    if is_version_like(&tag) && better {
+                        announced = Some(tag);
+                        announced_src = "Sophon(getBuild)";
+                        announce_err = None;
+                    }
+                }
+                Err(e) => println!("[sophon] 取 tag 失败(回退公告推断): {}", e),
+            }
+        }
+
+        // ④ 远程"最新版本" = 整包 / 预下载 / 公告(或Sophon tag) 三者取最大
         let mut best = major.version.clone();
         let mut version_source = "整包".to_string();
-        for (cand, name) in [(pre_version.clone(), "预下载"), (announced.clone(), "公告(推断)")] {
+        
+        // 🌟 显式声明数组类型，彻底解决 Rust 生命周期推断报错
+        let candidates: [(Option<String>, &str); 2] = [
+            (pre_version.clone(), "预下载"),
+            (announced.clone(), announced_src),
+        ];
+        
+        for (cand, name) in candidates {
             if let Some(v) = cand {
                 if is_version_like(&v) && compare_versions(&v, &best) == Ordering::Greater {
                     best = v;
@@ -1512,7 +1545,7 @@ impl GamePlatform for MihoyoPlatform {
 
         // ⑤ 版本守卫：本地 vs 整包（能下载的）+ 官宣（判断是否已落后于真实版本）
         let local = self.detect(app).into_iter().find(|g| g.id == game_id).and_then(|g| g.local_version);
-        let relation = match &local {
+        let mut relation = match &local {  // 🌟 改成 let mut relation
             None => "fresh",
             Some(lv) => match compare_versions(lv, &major.version) {
                 Ordering::Less => "ahead",
@@ -1521,11 +1554,26 @@ impl GamePlatform for MihoyoPlatform {
             },
         };
 
+        // 🌟 Sophon 体系特判：原神/星铁整包落后是常态，按 Sophon/公告版本定关系
+        if relation == "behind" && (biz == "hk4e_cn" || biz == "hkrpg_cn") {
+            if let Some(lv) = &local {
+                match compare_versions(&best, lv) {
+                    Ordering::Greater => relation = "announced",
+                    Ordering::Equal => relation = "equal",
+                    _ => {}
+                }
+            }
+        }
+
         // 解压后的安装体积：米哈游按"分卷"给 decompressed_size（末卷数值不同，可确认是按卷计的），求和即整包安装体积
         let install_size: u64 = major.game_pkgs.iter()
             .filter_map(|p| p.decompressed_size.parse::<u64>().ok())
             .sum();
         let install_size = if install_size > 0 { install_size } else { parts.iter().map(|p| p.size).sum() };
+
+
+
+        
 
         Ok(RemoteGameInfo {
             game_id: game_id.into(), latest_version: major.version.clone(),
@@ -1548,6 +1596,58 @@ impl GamePlatform for MihoyoPlatform {
     fn download(&self, app: &tauri::AppHandle, game_id: &str, dest: &str, use_patch: bool, allow_old: bool, cancel: Arc<AtomicBool>) -> Result<String, String> {
         let info = self.remote_info(app, game_id)?;
 
+        // src-tauri/src/platforms/mihoyo.rs (在 download 函数内)
+
+        // 🌟 新增：原神/星铁 路由到 Sophon 引擎 (同步版)
+        if game_id == "genshin" || game_id == "starrail" {
+            let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
+            println!("[{}] 检测到 Sophon 体系游戏，启动 Chunk 更新引擎", game_id);
+            
+            let client = reqwest::blocking::Client::new();
+            let bundle = crate::sophon::fetch_game_manifest(&client, biz, "游戏资源")
+                .map_err(|e| format!("获取 Sophon 清单失败: {}", e))?;
+                
+            println!("[{}] 远程最新版本: {}", game_id, bundle.tag);
+
+            let dest_path = Path::new(dest);
+            let result = crate::sophon::apply_update(
+                &client,
+                &bundle.manifest,
+                &bundle.chunk_prefix,
+                dest_path,
+                &dest_path.join("ql_staging"),
+                move |p| {
+                    // 🌟 阶段进度：转换为现有的 DownloadProgress 事件发送给前端
+                    let progress = DownloadProgress {
+                        game_id: game_id.into(),
+                        downloaded: p.bytes_downloaded,
+                        total: 0, // Sophon 边下边组装，不预知总下载量
+                        speed: 0,   
+                        eta_seconds: None,
+                        status: format!("chunking:{}/{}|{}", p.chunks_done, p.chunks_total, p.current_file),
+                    };
+                    let _ = app.emit("download-progress", progress);
+                },
+            );
+
+            if let Err(e) = result {
+                return Err(format!("Sophon 更新失败: {}", e));
+            }
+
+            crate::sophon::bump_config_version(dest_path, &bundle.tag)?;
+            println!("[{}] 版本号已更新为 {}", game_id, bundle.tag);
+            
+            let _ = app.emit("download-progress", DownloadProgress { 
+                game_id: game_id.into(), downloaded: 0, total: 0, speed: 0, eta_seconds: Some(0), 
+                status: format!("done:{}", dest) 
+            });
+            return Ok(format!("Sophon 更新完成: {}", bundle.tag));
+        }
+
+        
+
+// ... (下方保留原有的 hdiff/整包下载逻辑，用于绝区零等) ...
+        
         // P0：后端双保险守卫
         if info.version_relation == "equal" {
             return Err(format!("本地 v{} 已是最新，无需下载", info.latest_version));

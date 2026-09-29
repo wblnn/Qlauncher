@@ -4,7 +4,6 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 
-
 const games = ref([])
 const loading = ref(false)
 const runningGames = ref({})
@@ -69,16 +68,25 @@ function pct(gameId) {
 }
 
 // P0：只有 fresh(未安装) 或 ahead(有更新) 才允许下载
+// 🌟 新增：原神/星铁的 announced 状态也允许下载（走 Sophon 引擎）
 function canDownload(game) {
   const r = remotes.value[game.id]
   if (!r) return false
-  return r.version_relation === 'fresh' || r.version_relation === 'ahead'
+  if (r.version_relation === 'fresh' || r.version_relation === 'ahead') return true
+  if (r.version_relation === 'announced' && (game.id === 'genshin' || game.id === 'starrail')) return true
+  return false
 }
 
 // 按钮文案：差分可用时显示差分大小，否则整包大小
 function downloadLabel(game) {
   const r = remotes.value[game.id]
   if (!r) return '⬇ 下载'
+  
+  // 🌟 原神/星铁走 Sophon 引擎
+  if (r.version_relation === 'announced' && (game.id === 'genshin' || game.id === 'starrail')) {
+    return `⬇ 增量更新 (Sophon)`
+  }
+  
   if (r.version_relation === 'announced') return `⬇ 旧版整包 v${r.latest_version}`
   if (r.version_relation === 'ahead' && r.patch_from && r.patch_from === game.local_version) {
     return `⬇ 差分 ${fmtBytes(r.patch_size)}`
@@ -90,6 +98,12 @@ function relationTip(game) {
   const r = remotes.value[game.id]
   if (!r) return ''
   const at = r.checked_at ? `（检查于 ${new Date(r.checked_at * 1000).toLocaleTimeString().slice(0, 5)}·来源 ${r.version_source || '整包'}）` : ''
+  
+  // 🌟 原神/星铁 announced 提示
+  if (r.version_relation === 'announced' && (game.id === 'genshin' || game.id === 'starrail')) {
+    return `｜🚀 官宣 v${r.announced_version}，已启用 Sophon 增量引擎` + at
+  }
+  
   if (r.version_relation === 'equal') return '｜✅ 已是最新' + at
   if (r.version_relation === 'behind') return `｜⚠️ 接口整包滞后(本地 v${r.local_version} 更新)，禁下载` + at
   if (r.version_relation === 'announced') return `｜⚠️ 官宣 v${r.announced_version}（推断），接口整包只到 v${r.latest_version} → 请用『🩺 官方更新』` + at
@@ -118,7 +132,6 @@ async function loadGames() {
 async function updateRunningStatus() {
   try { runningGames.value = await invoke('get_running_games') } catch (e) {}
   nowTick.value = Date.now()
-  // 更新进行中：顺便刷新 journal，让阶段指示器实时走（patch_status 很轻，且已在线程池执行）
   if (patchBusy.value) {
     try {
       const st = await invoke('patch_status', { gameId: patchBusy.value })
@@ -165,8 +178,13 @@ async function startDownload(gameId, forceFull = false) {
   const r = remotes.value[gameId]
   const isPatch = !forceFull && r && r.patch_from && r.patch_from === game?.local_version
   let allowOld = false
-  if (r && r.version_relation === 'announced' && !forceFull) {
-    // 官宣有新版但整包停更：默认劝退，给一次"我就要旧版"的二次确认
+  
+  // 🌟 原神/星铁 Sophon 更新提示
+  if (r && r.version_relation === 'announced' && (gameId === 'genshin' || gameId === 'starrail') && !forceFull) {
+    if (!confirm(`🚀 检测到 ${game.name} 已启用 Sophon 增量更新引擎。\n\n将直接下载并组装最新版本 (v${r.announced_version}) 的文件块，无需下载完整压缩包。\n\n确认开始更新？`)) return
+    allowOld = true 
+  } 
+  else if (r && r.version_relation === 'announced' && !forceFull) {
     if (!confirm(`⚠️ 官方已发布 v${r.announced_version}（来源：${r.version_source}），但接口整包只到 v${r.latest_version}。\n\n继续只会下载【旧版 v${r.latest_version}】，不会让你变成 v${r.announced_version}。\n要更新到最新版请用『🩺 官方更新』（拉起官方启动器）。\n\n仍要下载旧版整包吗？`)) return
     allowOld = true
   } else {
@@ -175,8 +193,13 @@ async function startDownload(gameId, forceFull = false) {
       : `整包安装：下载约 ${fmtBytes(r?.package_size || 0)}，解压后安装约 ${fmtBytes(r?.install_size || 0)}。\n\n⚠️ 目标盘需要同时容纳两者（约 ${fmtBytes((r?.package_size || 0) + (r?.install_size || 0))}），确认继续？`
     if (!confirm(warn)) return
   }
+  
   try {
-    progress.value[gameId] = { downloaded: 0, total: isPatch ? (r?.patch_size || 0) : (r?.package_size || 0), status: 'downloading' }
+    // 🌟 Sophon 没有预知的 total bytes，给个占位符 0，靠 status 显示进度
+    const isSophon = (gameId === 'genshin' || gameId === 'starrail') && r.version_relation === 'announced'
+    const totalBytes = isSophon ? 0 : (isPatch ? (r?.patch_size || 0) : (r?.package_size || 0))
+                       
+    progress.value[gameId] = { downloaded: 0, total: totalBytes, status: 'downloading' }
     await invoke('start_download', { gameId, dest, usePatch: isPatch, allowOld })
   } catch (e) { delete progress.value[gameId]; alert('启动下载失败: ' + e) }
 }
@@ -191,13 +214,40 @@ onMounted(() => {
   timer = setInterval(updateRunningStatus, 2000)
   listen('download-progress', (event) => {
     const p = event.payload
-    if (p.status === 'downloading' || p.status === 'repairing' || p.status === 'verifying' || p.status === 'extracting') progress.value[p.game_id] = p
+    if (p.status === 'downloading' || p.status === 'repairing' || p.status === 'verifying' || p.status === 'extracting') {
+      progress.value[p.game_id] = p
+    } 
+    // 🌟 新增：处理 Sophon chunking 状态
+    else if (p.status.startsWith('chunking:')) {
+      const match = p.status.match(/chunking:(\d+)\/(\d+)\|(.*)/)
+      if (match) {
+        const done = parseInt(match[1])
+        const total = parseInt(match[2])
+        const file = match[3]
+        progress.value[p.game_id] = {
+          ...p,
+          downloaded: done,
+          total: total,
+          status: 'chunking',
+          current_file: file
+        }
+      } else {
+        progress.value[p.game_id] = p
+      }
+    }
     else if (p.status.startsWith('done_test:')) {
       delete progress.value[p.game_id]
       alert('🧪 保命线生效！已安全截断，硬盘安全。文件在：' + p.status.slice(10))
     }
-    else if (p.status.startsWith('done:')) { delete progress.value[p.game_id]; alert('下载完成：' + p.status.slice(5)) }
-    else { delete progress.value[p.game_id]; alert('下载结束：' + p.status.replace('error:', '')) }
+    else if (p.status.startsWith('done:')) { 
+      delete progress.value[p.game_id]
+      alert('下载/更新完成：' + p.status.slice(5)) 
+      loadGames() // 🌟 完成后刷新游戏列表，更新本地版本号
+    }
+    else { 
+      delete progress.value[p.game_id]
+      alert('下载结束：' + p.status.replace('error:', '')) 
+    }
   })
   listen('patch-progress', (event) => {
     const p = event.payload
@@ -263,7 +313,6 @@ async function killGame(gameId) {
   try {
     const msg = await invoke('kill_game', { gameId })
     console.log(msg)
-    // 杀掉后立刻刷新一次状态，不用等 2 秒心跳
     await updateRunningStatus()
   } catch (e) {
     alert('关闭失败: ' + e)
@@ -280,11 +329,10 @@ async function scanZombies() {
 async function killZombie(pid) {
   try {
     console.log(await invoke('kill_process', { pid }))
-    await scanZombies() // 刷新一遍，看它消失
+    await scanZombies()
   } catch (e) { alert('杀死僵尸进程失败: ' + e) }
 }
 
-// ===== 更新应变：继续 / 回滚 / 兜底 =====
 async function loadPatchState() {
   const ids = games.value.filter(g => g.id !== 'test_notepad').map(g => g.id)
   const res = await Promise.all(ids.map(id => invoke('patch_status', { gameId: id }).catch(() => null)))
@@ -308,9 +356,7 @@ async function rollbackPatch(gameId) {
   } catch (e) { alert('回滚失败: ' + e) }
 }
 
-// ===== 🩹 校验修复：删/坏了几个文件时只补这几个，不用重下整包 =====
 async function verifyRepair(gameId) {
-  // 确定 = 快速（只比大小）；取消 = 深度（逐文件算 md5，慢但能发现"大小对但内容坏"）
   const deep = !confirm('校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
   patchBusy.value = gameId
   patchBusyStart.value = Date.now()
@@ -340,7 +386,6 @@ async function verifyRepair(gameId) {
   }
 }
 
-// 兜底 L3：拉起官方启动器去「修复」
 async function officialRepair(gameId) {
   try {
     alert(await invoke('open_official', { gameId, mode: 'auto' }) +
@@ -348,7 +393,6 @@ async function officialRepair(gameId) {
   } catch (e) { alert('拉起官方启动器失败: ' + e) }
 }
 
-// 兜底 L4：整包下载到新目录（不碰当前这份可能已损坏的安装）
 async function downloadFull(gameId) {
   if (!confirm('把【完整整包】下载到一个新目录？\n不会改动当前安装；下完后可用官方启动器的「添加已有游戏」指向新目录。')) return
   await startDownload(gameId, true)
@@ -430,11 +474,9 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
             </template>
             <template v-if="game.platform_level === 'Full' || game.platform_level === 'Download'">
               <template v-if="game.status === '已安装'">
-                <!-- 正在运行时：显示红色的强制关闭按钮 -->
                 <button v-if="runningGames[game.id]" class="action-btn kill" @click.stop="killGame(game.id)">
                   ⏹ 强制关闭
                 </button>
-                <!-- 未运行时：显示正常的启动按钮 -->
                 <button v-else class="action-btn l3" @click.stop="launchGame(game.id, false)">
                   ▶ 启动
                 </button>
@@ -449,10 +491,18 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
           </div>
           <div v-if="progress[game.id]" class="progress-wrap">           
             <div class="progress-stats">
-              <span class="size">{{ progress[game.id].status === 'extracting' ? '📦 解压中 ' : '' }}{{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}（{{ pct(game.id).toFixed(1) }}%）</span>
+              <span class="size">
+                <template v-if="progress[game.id].status === 'extracting'">📦 解压中 </template>
+                <template v-else-if="progress[game.id].status === 'chunking'">
+                  🧩 组装中: {{ progress[game.id].current_file }} ({{ progress[game.id].downloaded }}/{{ progress[game.id].total }} 块)
+                </template>
+                <template v-else>
+                  {{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}（{{ pct(game.id).toFixed(1) }}%）
+                </template>
+              </span>
               <div class="progress-bar"><div class="progress-fill" :style="{ width: pct(game.id) + '%' }"></div></div>
-              <span class="speed">⚡ {{ fmtSpeed(progress[game.id].speed) }}</span>
-              <span class="eta">⏳ {{ fmtEta(progress[game.id].eta_seconds) }}</span>
+              <span v-if="progress[game.id].status !== 'chunking'" class="speed">⚡ {{ fmtSpeed(progress[game.id].speed) }}</span>
+              <span v-if="progress[game.id].status !== 'chunking'" class="eta">⏳ {{ fmtEta(progress[game.id].eta_seconds) }}</span>
             </div>
           </div>
           <div v-if="patchProgress[game.id]" class="patch-progress">🔧 {{ patchProgress[game.id] }}</div>
