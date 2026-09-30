@@ -1598,50 +1598,80 @@ impl GamePlatform for MihoyoPlatform {
 
         // src-tauri/src/platforms/mihoyo.rs (在 download 函数内)
 
-        // 🌟 新增：原神/星铁 路由到 Sophon 引擎 (同步版)
+        // 🌟 原神/星铁 路由到 Sophon 引擎
         if game_id == "genshin" || game_id == "starrail" {
-            let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
-            println!("[{}] 检测到 Sophon 体系游戏，启动 Chunk 更新引擎", game_id);
+            // 【修复1】：获取已绑定的游戏安装目录。
+            // 请把下面这行替换为你项目中 apply_patch 获取目录的同款代码！
+            // 例如：let game_dir_str = load_games_config(app)?.iter().find(|g| g.id == game_id).map(|g| g.dir.clone()).unwrap_or_default();
+            let game_dir_str = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;; 
+            let game_dir = PathBuf::from(game_dir_str);
             
-            let client = reqwest::blocking::Client::new();
-            let bundle = crate::sophon::fetch_game_manifest(&client, biz, "游戏资源")
-                .map_err(|e| format!("获取 Sophon 清单失败: {}", e))?;
-                
-            println!("[{}] 远程最新版本: {}", game_id, bundle.tag);
-
-            let dest_path = Path::new(dest);
-            let result = crate::sophon::apply_update(
-                &client,
-                &bundle.manifest,
-                &bundle.chunk_prefix,
-                dest_path,
-                &dest_path.join("ql_staging"),
-                move |p| {
-                    // 🌟 阶段进度：转换为现有的 DownloadProgress 事件发送给前端
-                    let progress = DownloadProgress {
-                        game_id: game_id.into(),
-                        downloaded: p.bytes_downloaded,
-                        total: 0, // Sophon 边下边组装，不预知总下载量
-                        speed: 0,   
-                        eta_seconds: None,
-                        status: format!("chunking:{}/{}|{}", p.chunks_done, p.chunks_total, p.current_file),
-                    };
-                    let _ = app.emit("download-progress", progress);
-                },
-            );
-
-            if let Err(e) = result {
-                return Err(format!("Sophon 更新失败: {}", e));
+            if !game_dir.exists() {
+                return Err(format!("{} 未绑定安装目录或目录不存在: {}", game_id, game_dir.display()));
             }
 
-            crate::sophon::bump_config_version(dest_path, &bundle.tag)?;
-            println!("[{}] 版本号已更新为 {}", game_id, bundle.tag);
-            
-            let _ = app.emit("download-progress", DownloadProgress { 
-                game_id: game_id.into(), downloaded: 0, total: 0, speed: 0, eta_seconds: Some(0), 
-                status: format!("done:{}", dest) 
+            let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
+            println!("[{}] Sophon 引擎启动, 作用目录: {}", game_id, game_dir.display());
+
+            let client = crate::sophon::blocking_client();
+            let staging_dir = game_dir.join("ql_staging");
+
+            // 定义需要更新的分类：核心资源 + 中文语音
+            let categories = ["游戏资源", "语音包-中文"];
+
+            for category in categories {
+                println!("[{}] >>> 开始处理分类: {}", game_id, category);
+                
+                // 【修复2】：去掉 &info.launcher_id，保持 3 个参数，匹配当前 sophon.rs 的签名
+                let bundle = match crate::sophon::fetch_game_manifest(&client, biz, category) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!("[{}] 获取 {} 清单失败(可能无此分类或网络问题): {}", game_id, category, e);
+                        continue; // 语音包失败不阻断游戏资源，反之亦然
+                    }
+                };
+                println!("[{}] {} 远程版本: {}", game_id, category, bundle.tag);
+
+                // 2. 执行对账与更新
+                let app2 = app.clone();
+                let gid = game_id.to_string();
+                let cat_name = category.to_string();
+                let result = crate::sophon::apply_update(
+                    &client,
+                    &bundle.manifest,
+                    &bundle.chunk_prefix,
+                    &game_dir,
+                    &staging_dir,
+                    move |p| {
+                        let _ = app2.emit("download-progress", DownloadProgress {
+                            game_id: gid.clone(),
+                            downloaded: p.bytes_downloaded,
+                            total: 0,
+                            speed: 0,
+                            eta_seconds: None,
+                            // 前端显示当前在更哪个包
+                            status: format!("chunking:[{}]{}/{}|{}", cat_name, p.chunks_done, p.chunks_total, p.current_file),
+                        });
+                    },
+                );
+
+                match result {
+                    Ok(msg) => println!("[{}] {} 完成: {}", game_id, category, msg),
+                    Err(e) => return Err(format!("Sophon 更新 {} 失败: {}", category, e)),
+                }
+            }
+
+            // 3. 全部完成后，统一更新 config.ini 版本号（取游戏资源的 tag）
+            let game_bundle = crate::sophon::fetch_game_manifest(&client, biz, "游戏资源")
+                .map_err(|e| format!("二次获取tag失败: {}", e))?;
+            crate::sophon::bump_config_version(&game_dir, &game_bundle.tag)?;
+            println!("[{}] 版本号已更新为 {}", game_id, game_bundle.tag);
+
+            let _ = app.emit("download-progress", DownloadProgress {
+                game_id: game_id.into(), downloaded: 0, total: 0, speed: 0, eta_seconds: Some(0),
+                status: format!("done:{}", game_dir.display()),
             });
-            return Ok(format!("Sophon 更新完成: {}", bundle.tag));
+            return Ok(format!("Sophon 更新完成(含语音): {}", game_bundle.tag));
         }
 
         

@@ -1,6 +1,16 @@
 // src-tauri/src/sophon.rs (同步阻塞版)
 use prost::Message;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+
+/// 统一阻塞客户端：带超时，防网络卡死时查版本/更新永久挂起
+pub fn blocking_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonManifest {
@@ -131,6 +141,71 @@ pub struct ApplyProgress {
     pub current_file: String,
 }
 
+pub struct DiffReport {
+    pub unchanged: usize,
+    pub changed: Vec<GameFile>,
+    pub chunk_count: usize,
+    pub download_bytes: u64,
+}
+
+pub fn diff_local<F: Fn(usize, usize)>(
+    manifest: SophonManifest,
+    game_dir: &Path,
+    on_progress: F,
+) -> Result<DiffReport, String> {
+    let mut changed = Vec::new();
+    let mut unchanged = 0usize;
+    let mut chunk_ids = std::collections::HashSet::new();
+    let mut download_bytes = 0u64;
+    let total = manifest.files.len();
+    for (i, f) in manifest.files.iter().enumerate() {
+        if i % 100 == 0 { on_progress(i, total); }
+        if f.is_folder { continue; }
+        let local = game_dir.join(&f.file);
+        let need = match std::fs::metadata(&local) {
+            Err(_) => true,
+            Ok(m) => {
+                if m.len() != f.size as u64 { true } else { stream_md5(&local)? != f.md5.trim().to_lowercase() }
+            }
+        };
+        if need {
+            for c in &f.chunks {
+                if chunk_ids.insert(c.md5.trim().to_lowercase()) { download_bytes += c.compressed_size as u64; }
+            }
+            changed.push(f.clone());
+        } else { unchanged += 1; }
+    }
+    Ok(DiffReport { unchanged, changed, chunk_count: chunk_ids.len(), download_bytes })
+}
+
+fn stream_md5(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("打开失败 {}: {}", path.display(), e))?;
+    let mut ctx = md5::Context::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        ctx.consume(&buf[..n]);
+    }
+    Ok(format!("{:x}", ctx.compute()))
+}
+
+/// ③ 配套修复：不用 canonicalize（Windows 返回 \\?\ 前缀致盘符匹配失败、剩余读成 0）
+fn free_space_mb_of(path: &Path) -> u64 {
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    let ps = path.to_string_lossy().to_lowercase();
+    for d in disks.list() {
+        let mp = d.mount_point().to_string_lossy().to_lowercase();
+        let mp = mp.trim_end_matches('\\');
+        if !mp.is_empty() && ps.starts_with(mp) {
+            return d.available_space() / 1048576;
+        }
+    }
+    0
+}
+
 pub fn apply_update<F>(
     client: &reqwest::blocking::Client,
     manifest: &SophonManifest,
@@ -139,63 +214,92 @@ pub fn apply_update<F>(
     staging_dir: &Path,
     mut on_progress: F,
 ) -> Result<String, String>
-where F: FnMut(&ApplyProgress) {
+where
+    F: FnMut(&ApplyProgress),
+{
     use std::io::{Read, Seek, SeekFrom, Write};
-    use sysinfo::Disks;
 
-    // 空间预检
-    let disks = Disks::new_with_refreshed_list();
-    let abs = std::fs::canonicalize(game_dir).unwrap_or_else(|_| game_dir.to_path_buf());
-    let free = disks.list().iter().find(|d| abs.starts_with(d.mount_point()))
-        .map(|d| d.available_space() / 1048576).unwrap_or(0);
-    let staging_need: u64 = manifest.files.iter().map(|f| f.size as u64).sum();
-    let need_mb = staging_need / 1048576 + 5120;
-    if free < need_mb {
-        return Err(format!("空间不足: 剩余 {:.1} GB, 需 {:.1} GB", free as f64 / 1024.0, need_mb as f64 / 1024.0));
+    let full_size: u64 = manifest.files.iter().map(|f| f.size as u64).sum();
+    println!("[sophon] manifest(全量): {} 文件 / {:.2} GB", manifest.files.len(), full_size as f64 / 1073741824.0);
+
+    // ③ 修复：先对账，只处理变更集
+    let report = diff_local(manifest.clone(), game_dir, |i, t| {
+        if i % 200 == 0 { println!("[sophon] 对账 {}/{}", i, t); }
+    })?;
+    let staging_need: u64 = report.changed.iter().map(|f| f.size as u64).sum();
+    println!(
+        "[sophon] 对账结果: 一致 {} | 变更 {} | 待下载(压缩) {:.2} GB | staging 需 {:.2} GB",
+        report.unchanged, report.changed.len(),
+        report.download_bytes as f64 / 1073741824.0,
+        staging_need as f64 / 1073741824.0
+    );
+    if report.changed.is_empty() {
+        return Ok("本地与远程清单一致，无需更新".into());
     }
 
-    let chunks_total: usize = manifest.files.iter().map(|f| f.chunks.len()).sum();
-    let mut p = ApplyProgress { chunks_done: 0, chunks_total, bytes_downloaded: 0, current_file: String::new() };
+    let free = free_space_mb_of(game_dir);
+    let need_mb = staging_need / 1048576 + 5120;
+    println!("[sophon] 空间: 剩余 {:.1} GB, 需 {:.1} GB", free as f64 / 1024.0, need_mb as f64 / 1024.0);
+    if free < need_mb {
+        return Err(format!(
+            "空间不足: 分区剩余 {:.1} GB, 需 {:.1} GB (变更文件 staging + 5GB 余量)",
+            free as f64 / 1024.0, need_mb as f64 / 1024.0
+        ));
+    }
 
-    for f in &manifest.files {
-        if f.is_folder { continue; }
+    let chunks_total: usize = report.changed.iter().map(|f| f.chunks.len()).sum();
+    let mut p = ApplyProgress { chunks_done: 0, chunks_total, bytes_downloaded: 0, current_file: String::new() };
+    let mut qlolds: Vec<PathBuf> = Vec::new();
+
+    for f in &report.changed {
         p.current_file = f.file.clone();
         let staging_path = staging_dir.join(&f.file);
         if let Some(par) = staging_path.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
 
+        let mut file = std::fs::OpenOptions::new()
+            .create(true).read(true).write(true)
+            .open(&staging_path)
+            .map_err(|e| format!("开 staging 文件失败 {}: {}", staging_path.display(), e))?;
+
         let mut chunks = f.chunks.clone();
         chunks.sort_by_key(|c| c.offset);
 
-        let mut file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&staging_path)
-            .map_err(|e| format!("开 staging 失败: {}", e))?;
-
         for c in &chunks {
-            // 断点续传检查
+            // 断点续传：staging 里该区域已正确则跳过
             let need = (c.offset + c.size) as u64;
             let mut ok = file.metadata().map(|m| m.len() >= need).unwrap_or(false);
             if ok {
                 let mut buf = vec![0u8; c.size as usize];
-                file.seek(SeekFrom::Start(c.offset as u64)).map_err(|e| e.to_string())?;
-                if file.read_exact(&mut buf).is_ok() {
-                    ok = format!("{:x}", md5::compute(&buf)) == c.md5.trim().to_lowercase();
-                } else { ok = false; }
+                ok = match (file.seek(SeekFrom::Start(c.offset as u64)), file.read_exact(&mut buf)) {
+                    (Ok(_), Ok(_)) => format!("{:x}", md5::compute(&buf)) == c.md5.trim().to_lowercase(),
+                    _ => false,
+                };
             }
             if ok { p.chunks_done += 1; on_progress(&p); continue; }
 
             let u1 = format!("{}{}", chunk_prefix, c.url_suffix);
             let u2 = format!("{}/{}", chunk_prefix, c.url_suffix);
-            let mut raw = Vec::new();
+            let mut raw: Vec<u8> = Vec::new();
+            let mut last_status = String::new();
             for u in [&u1, &u2] {
-                if let Ok(r) = client.get(u).send() {
-                    if r.status().is_success() {
-                        raw = r.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())?;
-                        break;
+                match client.get(u).send() {
+                    Ok(r) => {
+                        last_status = r.status().to_string();
+                        if r.status().is_success() {
+                            if let Ok(b) = r.bytes() { raw = b.to_vec(); break; }
+                        }
                     }
+                    Err(e) => last_status = e.to_string(),
                 }
             }
-            if raw.is_empty() { return Err(format!("chunk 下载失败: {}", f.file)); }
+            if raw.is_empty() {
+                return Err(format!("chunk 下载失败({}): {} (试过: {} / {})", last_status, f.file, u1, u2));
+            }
 
             let plain = zstd::decode_all(&raw[..]).map_err(|e| format!("chunk zstd 失败: {}", e))?;
+            if plain.len() as i64 != c.size {
+                return Err(format!("chunk 解压尺寸不符: 期望 {} 实际 {}", c.size, plain.len()));
+            }
             file.seek(SeekFrom::Start(c.offset as u64)).map_err(|e| e.to_string())?;
             file.write_all(&plain).map_err(|e| e.to_string())?;
             p.chunks_done += 1;
@@ -205,42 +309,59 @@ where F: FnMut(&ApplyProgress) {
         file.flush().map_err(|e| e.to_string())?;
         drop(file);
 
-        // 整文件 MD5 校验
-        let mut ctx = md5::Context::new();
-        let mut buf = vec![0u8; 1048576];
-        let mut rf = std::fs::File::open(&staging_path).map_err(|e| e.to_string())?;
-        loop {
-            let n = rf.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 { break; }
-            ctx.consume(&buf[..n]);
-        }
-        if format!("{:x}", ctx.compute()) != f.md5.trim().to_lowercase() {
-            return Err(format!("staging 整文件 md5 不符: {}", f.file));
+        let got = stream_md5(&staging_path)?;
+        if got != f.md5.trim().to_lowercase() {
+            return Err(format!("staging 整文件 md5 不符(续跑会重组该文件): {}", f.file));
         }
 
-        // 原子替换
         let target = game_dir.join(&f.file);
         if let Some(par) = target.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
         if target.exists() {
             let mut old = target.clone();
             old.set_file_name(format!("{}.qlold", old.file_name().unwrap().to_string_lossy()));
             let _ = std::fs::remove_file(&old);
-            std::fs::rename(&target, &old).map_err(|e| format!("移旧失败: {}", e))?;
+            std::fs::rename(&target, &old).map_err(|e| format!("移旧文件失败: {}", e))?;
             std::fs::rename(&staging_path, &target).map_err(|e| format!("替换失败: {}", e))?;
-            let _ = std::fs::remove_file(&old);
+            qlolds.push(old); // 小A：只记录，提交点统一删
         } else {
             std::fs::rename(&staging_path, &target).map_err(|e| e.to_string())?;
         }
     }
-    Ok(format!("完成: 更新 {} 个文件", manifest.files.len()))
+
+    for old in &qlolds { let _ = std::fs::remove_file(old); }
+
+    Ok(format!("完成: 替换 {} 个文件, 下载 {:.2} GB", report.changed.len(), p.bytes_downloaded as f64 / 1073741824.0))
 }
 
+// ① 修复：米哈游 config.ini 实际用 game_version=（lib.rs read_local_version 也读它），双 key 兼容
 pub fn bump_config_version(game_dir: &Path, ver: &str) -> Result<(), String> {
     let p = game_dir.join("config.ini");
-    if !p.exists() { return Ok(()); }
+    if !p.exists() {
+        return Ok(());
+    }
     let txt = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    let out: Vec<String> = txt.lines().map(|l| if l.trim_start().starts_with("version=") { format!("version={}", ver) } else { l.to_string() }).collect();
-    std::fs::write(&p, out.join("\r\n")).map_err(|e| e.to_string())?;
+    let mut hit = false;
+    let out: Vec<String> = txt
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("game_version=") {
+                hit = true;
+                format!("game_version={}", ver)
+            } else if t.starts_with("version=") {
+                hit = true;
+                format!("version={}", ver)
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if hit {
+        std::fs::write(&p, out.join("\r\n")).map_err(|e| e.to_string())?;
+        println!("[sophon] config.ini 版本号已写入: {}", ver);
+    } else {
+        println!("[sophon] 警告: config.ini 未找到 game_version=/version= 行, 跳过写入");
+    }
     Ok(())
 }
 
