@@ -15,8 +15,9 @@ A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 +
 - **Installed-game scanning**: reads the Windows uninstall registry keys plus per-platform directory rules to detect install paths, executables and local version numbers
 - **Manual binding**: when the registry scan comes up empty, bind a game directory manually via a folder-picker dialog
 - **Version guard (P0)**: semantic version comparison — downloads are only allowed when the state is `fresh` (not installed) or `ahead` (remote has an update); if the API's package lags behind the local version it is marked `behind` and downloading is blocked, preventing "updates that make your game older"
-- **Full / differential downloads**: patches are preferred (with patch size shown), falling back to full packages; multi-part packages (`parts`) are supported
-- **Download UX**: real-time progress events (downloaded / total / speed / ETA), cancel support, streaming buffering with a disk-usage safety line (`download_limit_mb`), optional download speed limit
+- **Full / differential downloads**: patches are preferred (with patch size shown; refused when the local version doesn't match `patch_from`), falling back to full packages; both support multi-part packages (`parts`); patch `.7z` archives are auto-extracted into `extracted/`
+- **Download UX**: real-time progress events (downloaded / total / instantaneous speed / ETA, emitted ~every 500 ms), cancel with partial-file cleanup, configurable streaming buffer (`download_buffer_mb`, larger = lower CPU usage), smooth CPU-yielding speed limit (`download_speed_limit_mbps`) and a disk-usage safety line (`download_limit_mb`)
+- **Resume-friendly**: parts already fully present on disk (matching size) are skipped when restarting a download
 - **Running-state detection**: polls processes via `sysinfo`, distinguishing "running / installed / not installed" in the UI
 - **Official entry points**: open the official website or invoke the official launcher (`launcher_uri`) with one click
 - **API self-diagnosis**: built-in 🔬 self-check command printing HYP API connectivity, `launcher_id` source and package-parsing results to help debug broken APIs
@@ -87,21 +88,28 @@ Vite uses a fixed port `1420` (`strictPort`) and ignores file watching under `sr
 ```jsonc
 {
   "launcher_id": "jGHBHlcOq1",      // HYP API launcher_id; falls back to the built-in default if empty
-  "download_limit_mb": 0,           // Disk-usage "safety line" for downloads, 0 = unlimited
-  "download_buffer_mb": 4,          // Streaming write buffer size (MB), controls peak memory usage
-  "download_speed_limit_mbps": 10   // Download speed limit (MB/s), 0 = unlimited
+  "download_limit_mb": 0,           // Disk-usage "safety line" for downloads, 0 = unlimited (truncates safely when reached; used for pipeline testing)
+  "download_buffer_mb": 4,          // Streaming write buffer size (MB), default 4; larger = lower CPU usage
+  "download_speed_limit_mbps": 10   // Download speed limit (MB/s), 0 or omitted = unlimited; implemented by yielding CPU time slices
 }
 ```
+
+Config is resolved in three tiers: **project source `src-tauri/channels.json` (primary dev config, takes effect immediately) → user app-data directory override (production) → built-in defaults**.
 
 An invalid `launcher_id` causes miHoYo API calls to return `retcode != 0`. In that case, click the 🔬 self-check button in the UI to view the report and replace this field.
 
 ## Download Pipeline
 
-1. `check_remote` fetches the version and part list (`parts`: url / md5 / size) and reports the `version_relation`
-2. `start_download` streams each part into the target directory while computing MD5 on the fly; aborts when `download_limit_mb` would be exceeded to protect the disk
-3. Each part is MD5-verified as soon as it finishes writing; on failure the part is deleted and an error is raised to avoid dirty files
-4. Differential packages (`.7z`) are automatically extracted into `extracted/` after download, with the inner structure printed, ready for later merging
-5. Throughout the process, `download-progress` events report progress, speed and ETA
+1. `check_remote` fetches the version and part list (`parts`: url / md5 / size) and reports the `version_relation` (fresh / ahead / equal / behind)
+2. The frontend picks the mode automatically: differential when local version == `patch_from` (confirmation shows patch size), otherwise full package
+3. `start_download` re-guards on the backend: refuses `equal` (already up to date), `behind` (prevents downgrade) and patch/full version mismatches
+4. Each part is streamed into the target directory (buffer = `download_buffer_mb`) with MD5 computed on the fly:
+   - Parts whose files already exist on disk at full size are skipped (resume-friendly)
+   - Every read loop checks the cancel flag and the `download_limit_mb` safety line; exceeding it truncates the download and emits `done_test`
+   - When a speed limit is active, the expected duration per chunk is computed and any surplus time is spent sleeping, so the CPU yields instead of busy-waiting
+5. Each part is MD5-verified as soon as it finishes writing; on failure the part is deleted and an error is raised to avoid dirty files
+6. Differential packages (`.7z`) are automatically extracted into `patch_<from>_<to>/extracted/` after download, with the inner structure printed, ready for later merging
+7. Throughout the process, `download-progress` events report progress, instantaneous speed and ETA roughly every 500 ms; cancelling deletes the partial file and emits `error:已取消`
 
 ## Supported Games & IDs
 
@@ -127,8 +135,8 @@ To add a game, simply register its ID in the corresponding platform's `game_ids(
 | `get_running_games` | Returns whether each game is currently running |
 | `official_info(game_id)` / `open_official(game_id, mode)` | Official-site info / open the official site |
 | `check_remote(game_id)` | Query the latest remote version, package size, patch availability & version relation |
-| `start_download(game_id, dest, use_patch)` | Start a download (full or differential) |
-| `cancel_download(game_id)` | Cancel an in-progress download |
+| `start_download(game_id, dest, use_patch)` | Start a download (full or differential; already-complete parts are skipped) |
+| `cancel_download(game_id)` | Cancel an in-progress download (partial files are cleaned up) |
 | `probe_api` | API self-diagnosis, returns an array of report lines |
 
 The frontend listens via `listen("download-progress", ...)` to receive `DownloadProgress` events and update the progress bar, speed and time remaining.

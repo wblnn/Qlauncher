@@ -15,8 +15,9 @@
 - **已安装游戏扫描**：读取 Windows 卸载注册表项 + 平台自有目录规则，识别安装路径、exe 与本地版本号
 - **手动绑定**：注册表扫不到时，可通过目录选择对话框手动绑定游戏目录
 - **版本守卫（P0）**：语义化版本比较，只有 `fresh`（未安装）或 `ahead`（远程有更新）才允许下载；接口整包滞后于本地版本时标记 `behind` 并禁止下载，避免"越更新越旧"
-- **整包 / 差分下载**：优先使用差分包（显示差分体积），无差分则回退整包；支持分卷包（`parts`）
-- **下载体验**：实时进度事件（已下载 / 总量 / 速度 / ETA）、取消下载、流式缓冲与磁盘占用保护线（`download_limit_mb`）、可选下载限速
+- **整包 / 差分下载**：优先使用差分包（显示差分体积，本地版本与差分源不匹配时拒绝下载），无差分则回退整包；整包与差分均支持多分卷（`parts`），差分 `.7z` 下完自动解压到 `extracted/`
+- **下载体验**：实时进度事件（已下载 / 总量 / 瞬时速度 / ETA，约 500ms 回传一次）、随时取消并清理半截文件、可配置流式缓冲区（`download_buffer_mb`，越大 CPU 占用越低）、基于让出 CPU 时间片的平滑限速（`download_speed_limit_mbps`）、磁盘占用保护线（`download_limit_mb`）
+- **断点友好**：重启下载时自动跳过大小已匹配的已完成分卷，无需从头重下
 - **运行状态检测**：基于 `sysinfo` 轮询进程，界面上区分"运行中 / 已安装 / 未安装"
 - **官方入口**：一键打开游戏官网或唤起官方启动器（`launcher_uri`）
 - **接口自检**：内置 🔬 自检命令，输出 HYP 接口连通性、`launcher_id` 来源、包信息解析结果，便于排查接口失效问题
@@ -87,21 +88,28 @@ Vite 固定端口 `1420`（`strictPort`），并忽略对 `src-tauri/` 的文件
 ```jsonc
 {
   "launcher_id": "jGHBHlcOq1",      // HYP 接口 launcher_id，留空则回退内置默认值
-  "download_limit_mb": 0,           // 下载磁盘占用"保命线"，0 = 不限制
-  "download_buffer_mb": 4,          // 流式写入缓冲区大小（MB），控制内存峰值
-  "download_speed_limit_mbps": 10   // 下载限速（MB/s），0 = 不限速
+  "download_limit_mb": 0,           // 下载磁盘占用"保命线"，0 = 不限制（达到即安全截断，用于管道测试）
+  "download_buffer_mb": 4,          // 流式写入缓冲区大小（MB），默认 4，越大 CPU 占用越低
+  "download_speed_limit_mbps": 10   // 下载限速（MB/s），0 或不填 = 不限速；限速通过让出 CPU 时间片实现
 }
 ```
+
+配置读取为三级来源：**项目源码 `src-tauri/channels.json`（开发期主配置，改文件即时生效）→ 用户数据目录覆盖（生产环境）→ 内置默认值**。
 
 `launcher_id` 失效会导致米哈游接口返回 `retcode != 0`，此时点击界面上的 🔬 自检查看报告，并替换此字段即可。
 
 ## 下载流程细节
 
-1. `check_remote` 拉取版本与分卷列表（`parts`：url / md5 / size），并给出 `version_relation`
-2. `start_download` 逐卷流式写入目标目录，边写边算 MD5；超出 `download_limit_mb` 时中止以保护磁盘
-3. 每卷写完即校验 MD5，失败则删除该卷并报错，避免脏文件残留
-4. 差分包（`.7z`）下载完成后自动解压到 `extracted/` 并打印内层结构，为后续合成做准备
-5. 全程通过 `download-progress` 事件回传进度、速度与 ETA
+1. `check_remote` 拉取版本与分卷列表（`parts`：url / md5 / size），并给出 `version_relation`（fresh / ahead / equal / behind）
+2. 前端根据差分可用性自动选择模式：本地版本 == `patch_from` 时走差分（显示差分体积确认框），否则整包
+3. `start_download` 后端二次守卫：`equal` 拒绝（已最新）、`behind` 拒绝（防止降级）、差分版本不匹配拒绝
+4. 逐卷流式写入目标目录（缓冲大小 = `download_buffer_mb`），边写边算 MD5：
+   - 磁盘上大小已等于该卷完整大小的文件直接跳过（断点友好）
+   - 每轮读循环检查取消标志与 `download_limit_mb` 保命线，超限即截断并回报 `done_test`
+   - 启用限速时按本块字节数计算应耗时，不足则 `sleep` 让出 CPU，避免忙等占满核心
+5. 每卷写完即校验 MD5，失败则删除该卷并报错，避免脏文件残留
+6. 差分包（`.7z`）下载完成后自动解压到 `patch_<from>_<to>/extracted/` 并打印内层结构，为后续合成做准备
+7. 全程约每 500ms 通过 `download-progress` 事件回传进度、瞬时速度与 ETA；取消时删除半截文件并回报 `error:已取消`
 
 ## 支持的游戏与 ID
 
@@ -127,8 +135,8 @@ Vite 固定端口 `1420`（`strictPort`），并忽略对 `src-tauri/` 的文件
 | `get_running_games` | 返回各游戏是否正在运行 |
 | `official_info(game_id)` / `open_official(game_id, mode)` | 官网信息与打开官网 |
 | `check_remote(game_id)` | 查询远程最新版本、包体积、差分与版本关系 |
-| `start_download(game_id, dest, use_patch)` | 开始下载（整包或差分） |
-| `cancel_download(game_id)` | 取消进行中的下载 |
+| `start_download(game_id, dest, use_patch)` | 开始下载（整包或差分，自动跳过已完成分卷） |
+| `cancel_download(game_id)` | 取消进行中的下载（清理半截文件） |
 | `probe_api` | 接口自检，返回诊断报告文本数组 |
 
 前端通过 `listen("download-progress", ...)` 接收 `DownloadProgress` 事件更新进度条、速度与剩余时间。
