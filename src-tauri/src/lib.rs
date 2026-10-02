@@ -428,7 +428,22 @@ pub fn check_available_space_mb(path: &Path) -> Result<u64, String> {
     Err("无法识别目标路径所在磁盘分区".to_string())
 }
 
-// 临时验证命令 v3：build_url 传 "branches" 时自动走 getGameBranches 拿最新构建
+/// hpatchz.exe 外置解析：优先 exe 同目录（打包版），回退项目目录（dev）
+pub fn find_hpatchz() -> Result<PathBuf, String> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cands.push(dir.join("hpatchz.exe"));
+        }
+    }
+    cands.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hpatchz.exe"));
+    for c in cands {
+        if c.exists() {
+            return Ok(c);
+        }
+    }
+    Err("未找到 hpatchz.exe：请把它放在 qlauncher.exe 同目录".into())
+}
 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

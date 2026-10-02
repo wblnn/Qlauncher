@@ -196,12 +196,24 @@ fn download_limit_bytes(app: &tauri::AppHandle) -> u64 {
     read_channels(app).download_limit_mb.unwrap_or(0) * 1024 * 1024
 }
 
-/// hpatchz.exe 位置：channels.json 覆盖 → 项目目录默认
+// hpatchz.exe 位置：channels.json 覆盖 → exe 同级目录 → 项目目录(dev兜底)
 fn hpatchz_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let cfg = read_channels(app);
     if let Some(p) = cfg.hpatchz_path.filter(|v| !v.trim().is_empty()) {
         return Ok(PathBuf::from(p));
     }
+    
+    // 优先：打包版找 qlauncher.exe 同目录
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("hpatchz.exe");
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
+    
+    // 兜底：dev 模式找源码目录
     Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join("hpatchz.exe"))
 }
 
