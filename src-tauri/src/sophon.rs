@@ -81,8 +81,9 @@ pub fn fetch_game_manifest(
     let resp = client.get(&branches_url).send().map_err(|e| e.to_string())?;
     let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
 
+    let mut cur_biz = None;
     let mut entries = Vec::new();
-    collect_entries(&v, "", "", &mut entries);
+    collect_entries(&v, &mut cur_biz, "", &mut entries);
 
     let chosen = entries
         .iter()
@@ -121,10 +122,17 @@ pub fn fetch_game_manifest(
     Ok(ManifestBundle { tag, build_id, chunk_prefix, manifest })
 }
 
-fn collect_entries(v: &serde_json::Value, biz: &str, hint: &str, out: &mut Vec<(String, String, String)>) {
+fn collect_entries(
+    v: &serde_json::Value,
+    biz: &mut Option<String>,
+    hint: &str,
+    out: &mut Vec<(String, String, String)>,
+) {
     match v {
         serde_json::Value::Object(map) => {
-            let cur = map.get("biz").and_then(|x| x.as_str()).unwrap_or(biz);
+            if let Some(b) = map.get("biz").and_then(|x| x.as_str()) {
+                *biz = Some(b.to_string());
+            }
             if let (Some(pid), Some(pw)) = (
                 map.get("package_id").and_then(|x| x.as_str()),
                 map.get("password").and_then(|x| x.as_str()),
@@ -134,15 +142,21 @@ fn collect_entries(v: &serde_json::Value, biz: &str, hint: &str, out: &mut Vec<(
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| if hint.is_empty() { "main".into() } else { hint.into() });
-                out.push((cur.to_string(), branch, format!("package_id={}&password={}", pid, pw)));
+                out.push((
+                    biz.clone().unwrap_or_default(),
+                    branch,
+                    format!("package_id={}&password={}", pid, pw),
+                ));
             }
             for (key, val) in map {
-                collect_entries(val, cur, key, out);
+                collect_entries(val, biz, key, out);
             }
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                collect_entries(item, biz, hint, out);
+                // 每个数组元素独立 biz 作用域：防上一个 game 的 biz 串到下一个
+                let mut scope = None;
+                collect_entries(item, &mut scope, hint, out);
             }
         }
         _ => {}
@@ -391,8 +405,9 @@ pub fn fetch_latest_tag(launcher_id: &str, biz: &str) -> Result<String, String> 
     );
     let resp = client.get(&branches_url).send().map_err(|e| e.to_string())?;
     let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let mut cur_biz = None;
     let mut entries = Vec::new();
-    collect_entries(&v, "", "", &mut entries);
+    collect_entries(&v, &mut cur_biz, "", &mut entries);
     let chosen = entries
         .iter()
         .find(|(b, br, _)| b == biz && br == "main")
