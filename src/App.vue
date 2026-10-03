@@ -221,15 +221,12 @@ onMounted(() => {
     else if (p.status.startsWith('chunking:')) {
       const match = p.status.match(/chunking:(\d+)\/(\d+)\|(.*)/)
       if (match) {
-        const done = parseInt(match[1])
-        const total = parseInt(match[2])
-        const file = match[3]
         progress.value[p.game_id] = {
-          ...p,
-          downloaded: done,
-          total: total,
+          ...p,                                  // downloaded/total 保留字节数
+          chunk_done: parseInt(match[1]),
+          chunk_total: parseInt(match[2]),
+          current_file: match[3],
           status: 'chunking',
-          current_file: file
         }
       } else {
         progress.value[p.game_id] = p
@@ -494,15 +491,15 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               <span class="size">
                 <template v-if="progress[game.id].status === 'extracting'">📦 解压中 </template>
                 <template v-else-if="progress[game.id].status === 'chunking'">
-                  🧩 组装中: {{ progress[game.id].current_file }} ({{ progress[game.id].downloaded }}/{{ progress[game.id].total }} 块)
+                  🧩 组装中: {{ progress[game.id].current_file }}（块 {{ progress[game.id].chunk_done || 0 }}/{{ progress[game.id].chunk_total || 0 }}）
                 </template>
                 <template v-else>
                   {{ fmtBytes(progress[game.id].downloaded) }} / {{ fmtBytes(progress[game.id].total) }}（{{ pct(game.id).toFixed(1) }}%）
                 </template>
               </span>
               <div class="progress-bar"><div class="progress-fill" :style="{ width: pct(game.id) + '%' }"></div></div>
-              <span v-if="progress[game.id].status !== 'chunking'" class="speed">⚡ {{ fmtSpeed(progress[game.id].speed) }}</span>
-              <span v-if="progress[game.id].status !== 'chunking'" class="eta">⏳ {{ fmtEta(progress[game.id].eta_seconds) }}</span>
+              <span class="speed">⚡ {{ fmtSpeed(progress[game.id].speed) }}</span>
+              <span class="eta">⏳ {{ fmtEta(progress[game.id].eta_seconds) }}</span>
             </div>
           </div>
           <div v-if="patchProgress[game.id]" class="patch-progress">🔧 {{ patchProgress[game.id] }}</div>

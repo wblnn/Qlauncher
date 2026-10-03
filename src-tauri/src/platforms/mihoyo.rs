@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 
+
 const HYP_BASE_CN: &str = "https://hyp-api.mihoyo.com/hyp/hyp-connect/api";
 const HYP_LAUNCHER_ID_CN: &str = "jGHBHlcOq1";
 const HYP_LANGUAGE: &str = "zh-cn";
@@ -677,6 +678,8 @@ pub fn repair_files(app: &tauri::AppHandle, game_id: &str) -> Result<String, Str
     });
     Ok(format!("修复已在后台启动（{} 个文件 / {}）", total, crate::fmt_size(total_bytes)))
 }
+
+
 
 // ================= 整包：分卷合并 + 自动解压 =================
 // 米哈游整包是"分卷单档"：a.zip.001/.002/… 或 a.7z.001/…，按顺序拼接就是一个完整压缩包
@@ -1511,15 +1514,14 @@ impl GamePlatform for MihoyoPlatform {
 
                 // 🌟 Sophon 权威版本：原神/星铁直接取 getBuild 的 tag（公告解析失败不再阻断更新）
         if biz == "hk4e_cn" || biz == "hkrpg_cn" {
-            let biz_clone = biz.clone();
-            
-            // 🌟 修复：使用 std::thread::spawn 避开 tokio worker 线程，防止 reqwest::blocking 引发 panic
-            let tag_result = std::thread::spawn(move || {
-                crate::sophon::fetch_latest_tag(&biz_clone)
-            }).join().unwrap_or(Err("获取 tag 线程异常".into()));
-
-            match tag_result {
-                Ok(tag) => {
+            let lid = launcher_id.clone();
+            let bz = biz.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::sophon::fetch_latest_tag(&lid, &bz));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+                Ok(Ok(tag)) => {
                     let better = announced.as_ref()
                         .map(|a| compare_versions(&tag, a) == Ordering::Greater)
                         .unwrap_or(true);
@@ -1529,7 +1531,8 @@ impl GamePlatform for MihoyoPlatform {
                         announce_err = None;
                     }
                 }
-                Err(e) => println!("[sophon] 取 tag 失败(回退公告推断): {}", e),
+                Ok(Err(e)) => println!("[sophon] 取 tag 失败(回退公告推断): {}", e),
+                Err(_) => println!("[sophon] 取 tag 20s 超时(回退公告推断，不阻塞查版本)"),
             }
         }
 
@@ -1615,7 +1618,7 @@ impl GamePlatform for MihoyoPlatform {
             // 【修复1】：获取已绑定的游戏安装目录。
             // 请把下面这行替换为你项目中 apply_patch 获取目录的同款代码！
             // 例如：let game_dir_str = load_games_config(app)?.iter().find(|g| g.id == game_id).map(|g| g.dir.clone()).unwrap_or_default();
-            let game_dir_str = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;; 
+            let game_dir_str = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
             let game_dir = PathBuf::from(game_dir_str);
             
             if !game_dir.exists() {
@@ -1633,21 +1636,23 @@ impl GamePlatform for MihoyoPlatform {
 
             for category in categories {
                 println!("[{}] >>> 开始处理分类: {}", game_id, category);
-                
-                // 【修复2】：去掉 &info.launcher_id，保持 3 个参数，匹配当前 sophon.rs 的签名
-                let bundle = match crate::sophon::fetch_game_manifest(&client, biz, category) {
+
+                let bundle = match crate::sophon::fetch_game_manifest(&client, &info.launcher_id, biz, category) {
                     Ok(b) => b,
                     Err(e) => {
                         println!("[{}] 获取 {} 清单失败(可能无此分类或网络问题): {}", game_id, category, e);
-                        continue; // 语音包失败不阻断游戏资源，反之亦然
+                        continue;
                     }
                 };
                 println!("[{}] {} 远程版本: {}", game_id, category, bundle.tag);
 
-                // 2. 执行对账与更新
                 let app2 = app.clone();
                 let gid = game_id.to_string();
                 let cat_name = category.to_string();
+                let mut last_emit = std::time::Instant::now();
+                let mut last_print = std::time::Instant::now();
+                let mut last_bytes = 0u64;
+                let mut last_speed = 0u64;
                 let result = crate::sophon::apply_update(
                     &client,
                     &bundle.manifest,
@@ -1655,14 +1660,35 @@ impl GamePlatform for MihoyoPlatform {
                     &game_dir,
                     &staging_dir,
                     move |p| {
+                        let now = std::time::Instant::now();
+                        let dt = now.duration_since(last_emit).as_secs_f64();
+                        if dt >= 0.5 {
+                            last_speed = ((p.bytes_downloaded - last_bytes) as f64 / dt) as u64;
+                            last_bytes = p.bytes_downloaded;
+                            last_emit = now;
+                        }
+                        let eta = if last_speed > 0 {
+                            Some((p.bytes_total.saturating_sub(p.bytes_downloaded)) / last_speed)
+                        } else {
+                            None
+                        };
+                        if last_print.elapsed().as_secs() >= 5 {
+                            last_print = std::time::Instant::now();
+                            println!(
+                                "[{}][{}] chunk {}/{} | {:.2}/{:.2} GB | {} B/s | {}",
+                                gid, cat_name, p.chunks_done, p.chunks_total,
+                                p.bytes_downloaded as f64 / 1073741824.0,
+                                p.bytes_total as f64 / 1073741824.0,
+                                last_speed, p.current_file
+                            );
+                        }
                         let _ = app2.emit("download-progress", DownloadProgress {
                             game_id: gid.clone(),
                             downloaded: p.bytes_downloaded,
-                            total: 0,
-                            speed: 0,
-                            eta_seconds: None,
-                            // 前端显示当前在更哪个包
-                            status: format!("chunking:[{}]{}/{}|{}", cat_name, p.chunks_done, p.chunks_total, p.current_file),
+                            total: p.bytes_total,
+                            speed: last_speed,
+                            eta_seconds: eta,
+                            status: format!("chunking:{}/{}|[{}] {}", p.chunks_done, p.chunks_total, cat_name, p.current_file),
                         });
                     },
                 );
@@ -1674,7 +1700,7 @@ impl GamePlatform for MihoyoPlatform {
             }
 
             // 3. 全部完成后，统一更新 config.ini 版本号（取游戏资源的 tag）
-            let game_bundle = crate::sophon::fetch_game_manifest(&client, biz, "游戏资源")
+            let game_bundle = crate::sophon::fetch_game_manifest(&client, &info.launcher_id,biz, "游戏资源")
                 .map_err(|e| format!("二次获取tag失败: {}", e))?;
             crate::sophon::bump_config_version(&game_dir, &game_bundle.tag)?;
             println!("[{}] 版本号已更新为 {}", game_id, game_bundle.tag);

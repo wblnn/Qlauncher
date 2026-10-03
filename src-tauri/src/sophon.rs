@@ -70,16 +70,19 @@ pub fn fetch_manifest(client: &reqwest::blocking::Client, manifest_url: &str) ->
 
 pub fn fetch_game_manifest(
     client: &reqwest::blocking::Client,
+    launcher_id: &str,
     biz: &str,
     category_kw: &str,
 ) -> Result<ManifestBundle, String> {
-    let branches_url = "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameBranches?launcher_id=jGHBHlcOq1";
-    let resp = client.get(branches_url).send().map_err(|e| e.to_string())?;
+    let branches_url = format!(
+        "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameBranches?launcher_id={}",
+        launcher_id
+    );
+    let resp = client.get(&branches_url).send().map_err(|e| e.to_string())?;
     let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
 
-    let mut cur_biz = None;
     let mut entries = Vec::new();
-    collect_entries(&v, &mut cur_biz, "", &mut entries);
+    collect_entries(&v, "", "", &mut entries);
 
     let chosen = entries
         .iter()
@@ -118,18 +121,30 @@ pub fn fetch_game_manifest(
     Ok(ManifestBundle { tag, build_id, chunk_prefix, manifest })
 }
 
-fn collect_entries(v: &serde_json::Value, biz: &mut Option<String>, hint: &str, out: &mut Vec<(String, String, String)>) {
+fn collect_entries(v: &serde_json::Value, biz: &str, hint: &str, out: &mut Vec<(String, String, String)>) {
     match v {
         serde_json::Value::Object(map) => {
-            if let Some(b) = map.get("biz").and_then(|x| x.as_str()) { *biz = Some(b.to_string()); }
-            if let (Some(pid), Some(pw)) = (map.get("package_id").and_then(|x| x.as_str()), map.get("password").and_then(|x| x.as_str())) {
-                let branch = map.get("branch").and_then(|x| x.as_str()).map(|s| s.to_string())
+            let cur = map.get("biz").and_then(|x| x.as_str()).unwrap_or(biz);
+            if let (Some(pid), Some(pw)) = (
+                map.get("package_id").and_then(|x| x.as_str()),
+                map.get("password").and_then(|x| x.as_str()),
+            ) {
+                let branch = map
+                    .get("branch")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
                     .unwrap_or_else(|| if hint.is_empty() { "main".into() } else { hint.into() });
-                out.push((biz.clone().unwrap_or_default(), branch, format!("package_id={}&password={}", pid, pw)));
+                out.push((cur.to_string(), branch, format!("package_id={}&password={}", pid, pw)));
             }
-            for (key, val) in map { collect_entries(val, biz, key, out); }
+            for (key, val) in map {
+                collect_entries(val, cur, key, out);
+            }
         }
-        serde_json::Value::Array(arr) => { for item in arr { collect_entries(item, biz, hint, out); } }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_entries(item, biz, hint, out);
+            }
+        }
         _ => {}
     }
 }
@@ -138,6 +153,7 @@ pub struct ApplyProgress {
     pub chunks_done: usize,
     pub chunks_total: usize,
     pub bytes_downloaded: u64,
+    pub bytes_total: u64,
     pub current_file: String,
 }
 
@@ -213,6 +229,7 @@ pub fn apply_update<F>(
     game_dir: &Path,
     staging_dir: &Path,
     mut on_progress: F,
+    
 ) -> Result<String, String>
 where
     F: FnMut(&ApplyProgress),
@@ -248,7 +265,7 @@ where
     }
 
     let chunks_total: usize = report.changed.iter().map(|f| f.chunks.len()).sum();
-    let mut p = ApplyProgress { chunks_done: 0, chunks_total, bytes_downloaded: 0, current_file: String::new() };
+    let mut p = ApplyProgress { chunks_done: 0, chunks_total, bytes_downloaded: 0, bytes_total: report.download_bytes, current_file: String::new() };
     let mut qlolds: Vec<PathBuf> = Vec::new();
 
     for f in &report.changed {
@@ -366,15 +383,16 @@ pub fn bump_config_version(game_dir: &Path, ver: &str) -> Result<(), String> {
 }
 
 /// 取指定 biz 的最新版本 tag（不下载 manifest），供版本对账使用
-pub fn fetch_latest_tag(biz: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::new();
-    let branches_url =
-        "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameBranches?launcher_id=jGHBHlcOq1";
-    let resp = client.get(branches_url).send().map_err(|e| e.to_string())?;
+pub fn fetch_latest_tag(launcher_id: &str, biz: &str) -> Result<String, String> {
+    let client = blocking_client();
+    let branches_url = format!(
+        "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameBranches?launcher_id={}",
+        launcher_id
+    );
+    let resp = client.get(&branches_url).send().map_err(|e| e.to_string())?;
     let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    let mut cur_biz = None;
     let mut entries = Vec::new();
-    collect_entries(&v, &mut cur_biz, "", &mut entries);
+    collect_entries(&v, "", "", &mut entries);
     let chosen = entries
         .iter()
         .find(|(b, br, _)| b == biz && br == "main")
