@@ -12,6 +12,16 @@ pub fn blocking_client() -> reqwest::blocking::Client {
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
+/// 分块下载专用客户端：单个 chunk 常有 8~16MB，用元数据那套 20s 总超时会在慢速线路上整片失败。
+/// 这里只限连接与单请求时长（600s 足够 16MB @ 30KB/s），不设"整个更新"的总超时。
+pub fn chunk_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonManifest {
     #[prost(message, repeated, tag = "1")]
@@ -110,8 +120,13 @@ pub fn fetch_game_manifest(
     let entry = manifests
         .iter()
         .find(|m| m["category_name"].as_str().map(|n| n.contains(category_kw)).unwrap_or(false))
-        .or_else(|| manifests.first())
-        .ok_or_else(|| "无匹配分类".to_string())?;
+        .ok_or_else(|| {
+            let names: Vec<String> = manifests.iter()
+                .filter_map(|m| m["category_name"].as_str().map(|s| s.to_string()))
+                .collect();
+            format!("getBuild 里没有匹配 \"{}\" 的分类。可用分类：{}（可在 channels.json 的 sophon_categories 里改）",
+                category_kw, names.join(" / "))
+        })?;
 
     let prefix = entry["manifest_download"]["url_prefix"].as_str().unwrap_or("");
     let id = entry["manifest"]["id"].as_str().unwrap_or("");
@@ -181,14 +196,20 @@ pub struct DiffReport {
 pub fn diff_local<F: Fn(usize, usize)>(
     manifest: SophonManifest,
     game_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
     on_progress: F,
 ) -> Result<DiffReport, String> {
+    use std::sync::atomic::Ordering as AtomicOrdering;
     let mut changed = Vec::new();
     let mut unchanged = 0usize;
     let mut chunk_ids = std::collections::HashSet::new();
     let mut download_bytes = 0u64;
     let total = manifest.files.len();
     for (i, f) in manifest.files.iter().enumerate() {
+        // 取消支持：对账要逐文件算 md5（82GB 要几分钟），必须能中途停
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err(format!("已取消（Sophon 对账到第 {}/{} 项，未改动任何文件）", i, total));
+        }
         if i % 100 == 0 { on_progress(i, total); }
         if f.is_folder { continue; }
         let local = game_dir.join(&f.file);
@@ -237,24 +258,26 @@ fn free_space_mb_of(path: &Path) -> u64 {
 }
 
 pub fn apply_update<F>(
-    client: &reqwest::blocking::Client,
     manifest: &SophonManifest,
     chunk_prefix: &str,
     game_dir: &Path,
     staging_dir: &Path,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut on_progress: F,
-    
 ) -> Result<String, String>
 where
     F: FnMut(&ApplyProgress),
 {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    // chunk 下载用专用客户端（大块 + 慢速线路），元数据客户端不适合
+    let chunk_client = chunk_client();
 
     let full_size: u64 = manifest.files.iter().map(|f| f.size as u64).sum();
     println!("[sophon] manifest(全量): {} 文件 / {:.2} GB", manifest.files.len(), full_size as f64 / 1073741824.0);
 
     // ③ 修复：先对账，只处理变更集
-    let report = diff_local(manifest.clone(), game_dir, |i, t| {
+    let report = diff_local(manifest.clone(), game_dir, &cancel, |i, t| {
         if i % 200 == 0 { println!("[sophon] 对账 {}/{}", i, t); }
     })?;
     let staging_need: u64 = report.changed.iter().map(|f| f.size as u64).sum();
@@ -283,6 +306,9 @@ where
     let mut qlolds: Vec<PathBuf> = Vec::new();
 
     for f in &report.changed {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err("已取消（已替换的文件保留，staging 里已下好的分块会在下次续跑时复用）".into());
+        }
         p.current_file = f.file.clone();
         let staging_path = staging_dir.join(&f.file);
         if let Some(par) = staging_path.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
@@ -308,12 +334,16 @@ where
             }
             if ok { p.chunks_done += 1; on_progress(&p); continue; }
 
+            if cancel.load(AtomicOrdering::Relaxed) {
+                return Err("已取消（staging 里已下好的分块会保留，下次续跑复用）".into());
+            }
+
             let u1 = format!("{}{}", chunk_prefix, c.url_suffix);
             let u2 = format!("{}/{}", chunk_prefix, c.url_suffix);
             let mut raw: Vec<u8> = Vec::new();
             let mut last_status = String::new();
             for u in [&u1, &u2] {
-                match client.get(u).send() {
+                match chunk_client.get(u).send() {
                     Ok(r) => {
                         last_status = r.status().to_string();
                         if r.status().is_success() {

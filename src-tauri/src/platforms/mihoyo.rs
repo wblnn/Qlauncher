@@ -38,8 +38,10 @@ pub struct ChannelsFile {
     keep_volumes_after_extract: Option<bool>,
     /// launcher_id 候选列表（按优先级；每个都会被 getGames 验证后才采用）
     launcher_ids: Option<Vec<String>>,
-    /// 渠道匹配规则：本地游戏键 → biz 前缀或中文名（米哈游改渠道名时改这里即可）
+    /// 渠道匹配规则：本地游戏键 → biz 前缀或显示名（米哈游改渠道名时改这里即可）
     biz_patterns: Option<HashMap<String, Vec<String>>>,
+    /// Sophon 更新要处理的分类（缺省 ["游戏资源", "语音包-中文"]）
+    sophon_categories: Option<Vec<String>>,
 
 }
 
@@ -61,7 +63,7 @@ fn read_channels(app: &tauri::AppHandle) -> ChannelsFile {
             }
         }
     }
-    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None, hpatchz_path: None, keep_volumes_after_extract: None, launcher_ids: None, biz_patterns: None }
+    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None, hpatchz_path: None, keep_volumes_after_extract: None, launcher_ids: None, biz_patterns: None, sophon_categories: None }
 }
 
 // ================= 版本源自适应：候选 launcher_id / 渠道匹配 / 公告推断 =================
@@ -143,7 +145,13 @@ fn match_biz(app: &tauri::AppHandle, game_id: &str, games: &[HypGameEntry]) -> O
     }
     let lower: Vec<String> = pats.iter().map(|p| p.to_lowercase()).collect();
     games.iter()
-        .find(|g| { let b = g.biz.to_lowercase(); lower.iter().any(|p| !p.is_empty() && b.starts_with(p.as_str())) })
+        .find(|g| {
+            let b = g.biz.to_lowercase();
+            let name = g.display.as_ref().map(|d| d.name.to_lowercase()).unwrap_or_default();
+            lower.iter().any(|p| {
+                !p.is_empty() && (b.starts_with(p.as_str()) || (!name.is_empty() && name.contains(p.as_str())))
+            })
+        })
         .map(|g| (g.biz.clone(), g.id.clone()))
 }
 
@@ -454,6 +462,9 @@ pub struct VerifyReport {
     pub local_version: String,
     pub remote_version: String,
     pub version_match: bool,
+    /// true = 该游戏走 Sophon 分块体系，本次是"分块清单对账"而非 pkg_version 比对
+    pub sophon_managed: bool,
+    pub sophon_tag: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -486,10 +497,71 @@ fn manifest_entries(dir: &str) -> Result<Vec<ManifestEntry>, String> {
     Ok(out)
 }
 
+/// Sophon 体系（原神/星铁）的校验：本地 pkg_version 清单在 Sophon 更新后会过期，
+/// 拿它比对会满屏假阳性 —— 所以改成拉官方分块清单、与本地逐文件对账（这套体系下"校验"的正确口径）。
+fn verify_sophon(app: &tauri::AppHandle, game_id: &str, game_dir: &str) -> Result<VerifyReport, String> {
+    let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
+    // 取消支持：界面『✖ 取消』会置这个标志，对账过程每文件检查一次
+    let cancel = crate::cancel_flag(game_id);
+    cancel.store(false, AtomicOrdering::SeqCst);
+    let lid = match hyp_resolve(app) { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
+    let client = crate::sophon::blocking_client();
+    let category = read_channels(app).sophon_categories
+        .and_then(|v| v.into_iter().next())
+        .unwrap_or_else(|| "游戏资源".to_string());
+    let bundle = crate::sophon::fetch_game_manifest(&client, &lid, biz, &category)
+        .map_err(|e| format!("获取 Sophon 清单失败: {}", e))?;
+    let tag = bundle.tag.clone();
+    let started = Instant::now();
+    let report = crate::sophon::diff_local(bundle.manifest, Path::new(game_dir), &cancel, |i, t| {
+        if i % 200 == 0 || i + 1 == t {
+            let el = started.elapsed().as_secs_f64();
+            let speed = if el > 0.0 { (i as f64 / el) as u64 } else { 0 };
+            let _ = app.emit("download-progress", DownloadProgress {
+                game_id: game_id.into(), downloaded: i as u64, total: t as u64, speed,
+                eta_seconds: if speed > 0 { Some((t.saturating_sub(i) as u64) / speed) } else { None },
+                status: "verifying".into() });
+            let _ = app.emit("verify-progress", PatchProgress {
+                game_id: game_id.into(), done: i as u64, total: t as u64,
+                current: format!("Sophon 对账 {}/{}", i, t), status: "patching".into() });
+        }
+    })?;
+    let local_version = crate::read_local_version(game_dir).unwrap_or_default();
+    let mut sample: Vec<String> = report.changed.iter().take(30)
+        .map(|f| format!("[需更新] {} ({})", f.file, crate::fmt_size(f.size as u64))).collect();
+    if sample.is_empty() { sample.push("✅ 与官方分块清单完全一致，无需更新".into()); }
+    let version_match = !local_version.is_empty() && local_version == tag;
+    // 注意：Sophon 口径不写 BROKEN_CACHE（逐文件 URL 补全不适用于分块体系）
+    Ok(VerifyReport {
+        manifest: format!("Sophon 分块清单（分类 {}，tag {}）", category, tag),
+        total: report.unchanged + report.changed.len(),
+        ok: report.unchanged,
+        missing: 0,
+        size_bad: report.changed.len(),
+        md5_bad: 0,
+        deep: true,
+        broken_bytes: report.download_bytes,
+        sample,
+        res_list_url: None,
+        local_version,
+        remote_version: tag.clone(),
+        version_match,
+        sophon_managed: true,
+        sophon_tag: Some(tag),
+    })
+}
+
 /// 快速校验 = 只比大小（秒级）；deep = 逐文件算 md5（82GB 约几分钟）
 pub fn verify_files(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Result<VerifyReport, String> {
     let game_dir = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
+    // 原神/星铁走 Sophon 清单对账（pkg_version 已不是权威）
+    if game_id == "genshin" || game_id == "starrail" {
+        return verify_sophon(app, game_id, &game_dir);
+    }
     let entries = manifest_entries(&game_dir)?;
+    // 取消支持：校验/深度扫描可能几分钟，界面『✖ 取消』必须能中断（以前这里完全没读标志位）
+    let cancel = crate::cancel_flag(game_id);
+    cancel.store(false, AtomicOrdering::SeqCst);
     let (res_list_url, remote_version) = match crate::platforms::platform_for_game(game_id) {
         Some(p) => match p.remote_info(app, game_id) {
             Ok(i) => (Some(i.res_list_url.clone()).filter(|s| !s.is_empty()), i.latest_version),
@@ -507,6 +579,9 @@ pub fn verify_files(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Result
     let started = Instant::now();
 
     for (i, e) in entries.iter().enumerate() {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err(format!("已取消（校验到第 {}/{} 项，未改动任何文件）", i, total));
+        }
         let p = Path::new(&game_dir).join(e.remote_name.replace('/', "\\"));
         let mut reason = "";
         match std::fs::metadata(&p) {
@@ -545,6 +620,7 @@ pub fn verify_files(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Result
         manifest: Path::new(&game_dir).join("pkg_version").display().to_string(),
         total, ok, missing, size_bad, md5_bad, deep, broken_bytes: bytes, sample,
         res_list_url, local_version, remote_version, version_match,
+        sophon_managed: false, sophon_tag: None,
     })
 }
 
@@ -564,6 +640,10 @@ fn url_encode_path(p: &str) -> String {
 /// 进度走 download-progress{status:"repairing"}：字节 + 速度 + 剩余秒数 → 界面直接画进度条和倒计时。
 /// 支持中途取消（复用界面的『✖ 取消』按钮）、单个文件失败自动重试 3 次。
 pub fn repair_files(app: &tauri::AppHandle, game_id: &str) -> Result<String, String> {
+    // 原神/星铁：逐文件补全用的是"旧版整包"的散列地址，会把已更新的文件降级搞乱
+    if game_id == "genshin" || game_id == "starrail" {
+        return Err("原神/星铁已改用 Sophon 分块体系：逐文件补全依赖旧整包的散列地址，会把新版本文件搞乱。\n→ 请直接点『⬇ 增量更新 (Sophon)』——它自带缺失/损坏文件的对账与补全（缺什么补什么）。".into());
+    }
     let game_dir = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
     let platform = crate::platforms::platform_for_game(game_id).ok_or("无平台支持")?;
     let info = platform.remote_info(app, game_id)?;
@@ -1111,9 +1191,33 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
             j.save(app);
             return Err(format!("第{}条: 源大小不符 {} 期望{} 实际{}", i, e.source_file_name, e.source_file_size, old_size));
         }
-        
-        
-        
+        // fail-closed：合成前先验"本地源文件"和"增量文件"的身份，
+        // 大小对但内容不对（本地被动过 / 增量下载损坏）也能在这里挡住，而不是合成出一个坏文件。
+        if !e.source_file_md5.is_empty() {
+            let got = file_md5(&old)?;
+            if !got.eq_ignore_ascii_case(&e.source_file_md5) {
+                j.phase = "failed".into();
+                j.message = format!("第{}条源 md5 不符：{}", i, e.source_file_name);
+                j.save(app);
+                return Err(format!("第{}条: 源文件 md5 不符 {} 期望{} 实际{}（本地版本/内容不匹配，已中止）",
+                    i, e.source_file_name, e.source_file_md5, got));
+            }
+        }
+        if e.patch_file_size > 0 {
+            let dsize = std::fs::metadata(&diff).map(|m| m.len()).unwrap_or(0);
+            if dsize != e.patch_file_size {
+                return Err(format!("第{}条: 增量大小不符 {} 期望{} 实际{}（补丁包不完整，重下差分包）",
+                    i, e.patch_file_name, e.patch_file_size, dsize));
+            }
+        }
+        if !e.patch_file_md5.is_empty() {
+            let got = file_md5(&diff)?;
+            if !got.eq_ignore_ascii_case(&e.patch_file_md5) {
+                return Err(format!("第{}条: 增量 md5 不符 {} 期望{} 实际{}（补丁文件损坏，重下差分包）",
+                    i, e.patch_file_name, e.patch_file_md5, got));
+            }
+        }
+
         // 合成到临时文件 → 校验 → 原件改名备份 → 落位
         let temp = PathBuf::from(format!("{}.qtmp", new.display()));
         run_hpatchz(app, &old, &diff, &temp)?;
@@ -1261,7 +1365,9 @@ fn hyp_get<T: for<'de> Deserialize<'de> + Send + 'static>(url: &str) -> Result<T
 
 #[derive(Deserialize)] pub struct HypRoot<T> { pub retcode: i64, #[serde(default)] pub message: String, pub data: Option<T> }
 #[derive(Deserialize)] pub struct HypGamesData { #[serde(default)] pub games: Vec<HypGameEntry> }
-#[derive(Deserialize)] pub struct HypGameEntry { #[serde(default)] pub id: String, #[serde(default)] pub biz: String }
+#[derive(Deserialize)] pub struct HypGameEntry { #[serde(default)] pub id: String, #[serde(default)] pub biz: String, #[serde(default)] pub display: Option<HypGameDisplay> }
+/// getGames 里的 display.name（中文名匹配用）
+#[derive(Deserialize)] pub struct HypGameDisplay { #[serde(default)] pub name: String }
 #[derive(Deserialize)] pub struct HypPackagesData { #[serde(default)] pub game_packages: Vec<HypGamePackages> }
 #[derive(Deserialize)] pub struct HypGamePackages { pub game: HypGameId, pub main: Option<HypMain>, #[serde(default)] pub pre_download: Option<HypPre> }
 /// 预下载（下个版本已宣布时才有内容）
@@ -1513,7 +1619,7 @@ impl GamePlatform for MihoyoPlatform {
         let mut announced_src: &str = "公告(推断)";
 
                 // 🌟 Sophon 权威版本：原神/星铁直接取 getBuild 的 tag（公告解析失败不再阻断更新）
-        if biz == "hk4e_cn" || biz == "hkrpg_cn" {
+        if game_id == "genshin" || game_id == "starrail" {
             let lid = launcher_id.clone();
             let bz = biz.clone();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1570,7 +1676,7 @@ impl GamePlatform for MihoyoPlatform {
         };
 
         // 🌟 Sophon 体系特判：原神/星铁整包落后是常态，按 Sophon/公告版本定关系
-        if relation == "behind" && (biz == "hk4e_cn" || biz == "hkrpg_cn") {
+        if relation == "behind" && (game_id == "genshin" || game_id == "starrail") {
             if let Some(lv) = &local {
                 match compare_versions(&best, lv) {
                     Ordering::Greater => relation = "announced",
@@ -1609,15 +1715,9 @@ impl GamePlatform for MihoyoPlatform {
     }
 
     fn download(&self, app: &tauri::AppHandle, game_id: &str, dest: &str, use_patch: bool, allow_old: bool, cancel: Arc<AtomicBool>) -> Result<String, String> {
-        let info = self.remote_info(app, game_id)?;
-
-        // src-tauri/src/platforms/mihoyo.rs (在 download 函数内)
-
-        // 🌟 原神/星铁 路由到 Sophon 引擎
+        // 🌟 原神/星铁 先路由到 Sophon 引擎：
+        //    这条路不能依赖整包接口（整包源停更/下架时它仍要能走），所以 remote_info 挪到它后面。
         if game_id == "genshin" || game_id == "starrail" {
-            // 【修复1】：获取已绑定的游戏安装目录。
-            // 请把下面这行替换为你项目中 apply_patch 获取目录的同款代码！
-            // 例如：let game_dir_str = load_games_config(app)?.iter().find(|g| g.id == game_id).map(|g| g.dir.clone()).unwrap_or_default();
             let game_dir_str = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
             let game_dir = PathBuf::from(game_dir_str);
             
@@ -1626,25 +1726,34 @@ impl GamePlatform for MihoyoPlatform {
             }
 
             let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
-            println!("[{}] Sophon 引擎启动, 作用目录: {}", game_id, game_dir.display());
+            // launcher_id 独立解析（走候选验证），失败就退回配置里的第一个候选
+            let lid = match hyp_resolve(app) { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
+            println!("[{}] Sophon 引擎启动, 作用目录: {}, launcher_id={}", game_id, game_dir.display(), lid);
 
             let client = crate::sophon::blocking_client();
             let staging_dir = game_dir.join("ql_staging");
 
-            // 定义需要更新的分类：核心资源 + 中文语音
-            let categories = ["游戏资源", "语音包-中文"];
+            // 分类列表可在 channels.json 的 sophon_categories 覆盖（米哈游改分类名时不用重编译）
+            let categories: Vec<String> = read_channels(app).sophon_categories
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| vec!["游戏资源".to_string(), "语音包-中文".to_string()]);
+            let mut applied_tag: Option<String> = None;
 
-            for category in categories {
+            for category in &categories {
+                if cancel.load(AtomicOrdering::Relaxed) {
+                    return Err("已取消（已替换的文件保留，下次点更新会续跑）".into());
+                }
                 println!("[{}] >>> 开始处理分类: {}", game_id, category);
 
-                let bundle = match crate::sophon::fetch_game_manifest(&client, &info.launcher_id, biz, category) {
+                let bundle = match crate::sophon::fetch_game_manifest(&client, &lid, biz, category) {
                     Ok(b) => b,
                     Err(e) => {
-                        println!("[{}] 获取 {} 清单失败(可能无此分类或网络问题): {}", game_id, category, e);
+                        println!("[{}] 获取 {} 清单失败: {}", game_id, category, e);
                         continue;
                     }
                 };
                 println!("[{}] {} 远程版本: {}", game_id, category, bundle.tag);
+                if applied_tag.is_none() { applied_tag = Some(bundle.tag.clone()); }
 
                 let app2 = app.clone();
                 let gid = game_id.to_string();
@@ -1654,11 +1763,11 @@ impl GamePlatform for MihoyoPlatform {
                 let mut last_bytes = 0u64;
                 let mut last_speed = 0u64;
                 let result = crate::sophon::apply_update(
-                    &client,
                     &bundle.manifest,
                     &bundle.chunk_prefix,
                     &game_dir,
                     &staging_dir,
+                    cancel.clone(),
                     move |p| {
                         let now = std::time::Instant::now();
                         let dt = now.duration_since(last_emit).as_secs_f64();
@@ -1699,18 +1808,20 @@ impl GamePlatform for MihoyoPlatform {
                 }
             }
 
-            // 3. 全部完成后，统一更新 config.ini 版本号（取游戏资源的 tag）
-            let game_bundle = crate::sophon::fetch_game_manifest(&client, &info.launcher_id,biz, "游戏资源")
-                .map_err(|e| format!("二次获取tag失败: {}", e))?;
-            crate::sophon::bump_config_version(&game_dir, &game_bundle.tag)?;
-            println!("[{}] 版本号已更新为 {}", game_id, game_bundle.tag);
+            // 3. 用"实际应用的那个 tag"写 config.ini（不再二次 fetch，避免版本漂移 + 省一次请求）
+            let tag = applied_tag.ok_or("没有任何分类更新成功，无法确定版本号")?;
+            crate::sophon::bump_config_version(&game_dir, &tag)?;
+            println!("[{}] 版本号已更新为 {}", game_id, tag);
 
             let _ = app.emit("download-progress", DownloadProgress {
                 game_id: game_id.into(), downloaded: 0, total: 0, speed: 0, eta_seconds: Some(0),
                 status: format!("done:{}", game_dir.display()),
             });
-            return Ok(format!("Sophon 更新完成(含语音): {}", game_bundle.tag));
+            return Ok(format!("Sophon 更新完成: {}", tag));
         }
+
+        // 传统整包/差分路径才需要整包接口信息（放这里，Sophon 那条路就不受整包下架影响）
+        let info = self.remote_info(app, game_id)?;
 
         
 

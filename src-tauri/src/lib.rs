@@ -416,7 +416,7 @@ use sysinfo::Disks;
 
 /// 检查目标路径所在磁盘的可用空间 (单位: MB)
 pub fn check_available_space_mb(path: &Path) -> Result<u64, String> {
-    let mut disks = Disks::new_with_refreshed_list();
+    let disks = Disks::new_with_refreshed_list();
     // 规范化路径为绝对路径，确保能正确匹配挂载点
     let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     

@@ -172,33 +172,33 @@ async function probeApi() {
 }
 
 async function startDownload(gameId, forceFull = false) {
-  const dest = await open({ directory: true, multiple: false, title: '选择下载保存目录' })
-  if (!dest) return
   const game = games.value.find(g => g.id === gameId)
   const r = remotes.value[gameId]
-  const isPatch = !forceFull && r && r.patch_from && r.patch_from === game?.local_version
-  let allowOld = false
-  
-  // 🌟 原神/星铁 Sophon 更新提示
-  if (r && r.version_relation === 'announced' && (gameId === 'genshin' || gameId === 'starrail') && !forceFull) {
-    if (!confirm(`🚀 检测到 ${game.name} 已启用 Sophon 增量更新引擎。\n\n将直接下载并组装最新版本 (v${r.announced_version}) 的文件块，无需下载完整压缩包。\n\n确认开始更新？`)) return
-    allowOld = true 
-  } 
-  else if (r && r.version_relation === 'announced' && !forceFull) {
-    if (!confirm(`⚠️ 官方已发布 v${r.announced_version}（来源：${r.version_source}），但接口整包只到 v${r.latest_version}。\n\n继续只会下载【旧版 v${r.latest_version}】，不会让你变成 v${r.announced_version}。\n要更新到最新版请用『🩺 官方更新』（拉起官方启动器）。\n\n仍要下载旧版整包吗？`)) return
-    allowOld = true
+  // 🌟 原神/星铁走 Sophon：写的是已绑定游戏目录，不需要（也不该）让用户再选下载目录
+  const isSophon = (gameId === 'genshin' || gameId === 'starrail')
+  let dest = ''
+  if (isSophon) {
+    if (!confirm(`🚀 ${game.name} 已启用 Sophon 增量更新引擎。\n\n会直接对账已安装目录，只下载差异文件块（不需要整包压缩包，也不需要选下载目录）。\n\n远程版本：v${r?.announced_version || r?.latest_version || '?'}\n\n确认开始更新？`)) return
   } else {
-    const warn = isPatch
-      ? `差分更新：下载约 ${fmtBytes(r.patch_size)}（另需临时空间解压），确认开始？`
-      : `整包安装：下载约 ${fmtBytes(r?.package_size || 0)}，解压后安装约 ${fmtBytes(r?.install_size || 0)}。\n\n⚠️ 目标盘需要同时容纳两者（约 ${fmtBytes((r?.package_size || 0) + (r?.install_size || 0))}），确认继续？`
-    if (!confirm(warn)) return
+    dest = await open({ directory: true, multiple: false, title: '选择下载保存目录' })
+    if (!dest) return
   }
-  
+  const isPatch = !forceFull && !isSophon && r && r.patch_from && r.patch_from === game?.local_version
+  let allowOld = false
+  if (!isSophon) {
+    if (r && r.version_relation === 'announced' && !forceFull) {
+      if (!confirm(`⚠️ 官方已发布 v${r.announced_version}（来源：${r.version_source}），但接口整包只到 v${r.latest_version}。\n\n继续只会下载【旧版 v${r.latest_version}】，不会让你变成 v${r.announced_version}。\n要更新到最新版请用『🩺 官方更新』（拉起官方启动器）。\n\n仍要下载旧版整包吗？`)) return
+      allowOld = true
+    } else {
+      const warn = isPatch
+        ? `差分更新：下载约 ${fmtBytes(r.patch_size)}（另需临时空间解压），确认开始？`
+        : `整包安装：下载约 ${fmtBytes(r?.package_size || 0)}，解压后安装约 ${fmtBytes(r?.install_size || 0)}。\n\n⚠️ 目标盘需要同时容纳两者（约 ${fmtBytes((r?.package_size || 0) + (r?.install_size || 0))}），确认继续？`
+      if (!confirm(warn)) return
+    }
+  }
   try {
-    // 🌟 Sophon 没有预知的 total bytes，给个占位符 0，靠 status 显示进度
-    const isSophon = (gameId === 'genshin' || gameId === 'starrail') && r.version_relation === 'announced'
+    // Sophon 不预知总字节：给占位 0，靠 status 里的 chunking 显示进度
     const totalBytes = isSophon ? 0 : (isPatch ? (r?.patch_size || 0) : (r?.package_size || 0))
-                       
     progress.value[gameId] = { downloaded: 0, total: totalBytes, status: 'downloading' }
     await invoke('start_download', { gameId, dest, usePatch: isPatch, allowOld })
   } catch (e) { delete progress.value[gameId]; alert('启动下载失败: ' + e) }
@@ -354,10 +354,13 @@ async function rollbackPatch(gameId) {
 }
 
 async function verifyRepair(gameId) {
-  const deep = !confirm('校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
+  const isSophon = (gameId === 'genshin' || gameId === 'starrail')
+  // Sophon 游戏：校验就是"拉官方分块清单对账"，没有快/深之分
+  const deep = isSophon ? true
+    : !confirm('校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
   patchBusy.value = gameId
   patchBusyStart.value = Date.now()
-  patchProgress.value[gameId] = deep ? '深度校验：逐文件算 md5…' : '快速校验：比对文件大小…'
+  patchProgress.value[gameId] = isSophon ? 'Sophon 对账：拉官方分块清单…' : (deep ? '深度校验：逐文件算 md5…' : '快速校验：比对文件大小…')
   progress.value[gameId] = { downloaded: 0, total: 0, speed: 0, eta_seconds: null, status: 'verifying' }
   try {
     const r = await invoke('verify_game_files', { gameId, deep })
@@ -366,9 +369,15 @@ async function verifyRepair(gameId) {
     delete progress.value[gameId]
     const head = `清单来源：${r.manifest}\n共 ${r.total} 项 → 正常 ${r.ok} ｜ 缺失 ${r.missing} ｜ 大小不符 ${r.size_bad} ｜ md5 不符 ${r.md5_bad}\n` +
       `需要补下：${fmtBytes(r.broken_bytes)}\n本地 v${r.local_version} ｜ 接口 v${r.remote_version} ｜ 版本${r.version_match ? '一致 ✅' : '不一致 ⚠️'}\n` +
-      `散列地址：${r.res_list_url || '（无 → 无法单文件补全）'}`
+      `散列地址：${r.res_list_url || (r.sophon_managed ? '（Sophon 分块体系 → 走分块补全）' : '（无 → 无法单文件补全）')}`
     const list = r.sample.length ? `\n\n前 ${r.sample.length} 条：\n` + r.sample.join('\n') : ''
     const broken = r.missing + r.size_bad + r.md5_bad
+    // Sophon 体系：不走逐文件 URL 补全（那会用旧整包地址把新版本文件降级），直接引导到分块更新
+    if (r.sophon_managed) {
+      if (broken === 0) { alert(head + '\n\n✅ 与官方分块清单完全一致。'); return }
+      if (!confirm(head + list + `\n\n原神/星铁走 Sophon 分块体系：这 ${broken} 个差异文件要由分块引擎补（逐文件补全会用旧整包地址把文件搞乱，已禁用）。\n\n现在就开始分块更新吗？`)) return
+      return startDownload(gameId)
+    }
     if (broken === 0) { alert(head + '\n\n✅ 没有发现问题文件。'); return }
     if (!r.res_list_url) { alert(head + list + '\n\n⚠️ 该版本没有散列文件地址，无法按单文件补全 —— 请用『🩺 官方修复』或整包。'); return }
     if (!r.version_match) { alert(head + list + '\n\n⚠️ 本地版本与接口整包版本不一致：单文件地址指向接口那个版本，直接补可能把文件搞乱，已阻止。\n→ 先用官方启动器对齐版本，或走整包。'); return }
@@ -379,7 +388,9 @@ async function verifyRepair(gameId) {
   } catch (e) {
     patchBusy.value = ''
     delete patchProgress.value[gameId]
-    alert('校验/修复失败: ' + e)
+    delete progress.value[gameId]
+    const msg = String(e)
+    alert(msg.includes('已取消') ? '⏹ ' + msg : '校验/修复失败: ' + msg)
   }
 }
 
@@ -391,6 +402,11 @@ async function officialRepair(gameId) {
 }
 
 async function downloadFull(gameId) {
+  // 原神/星铁没有可下的整包（接口整包停在旧版本），这条路对它们只会误导
+  if (gameId === 'genshin' || gameId === 'starrail') {
+    alert('原神/星铁已改为 Sophon 分块体系：接口整包停在旧版本，没有可下载的"完整整包"。\n\n· 分块更新只作用于【已绑定的游戏目录】（会自动对账补齐缺失/损坏文件）\n· 想换安装目录：用官方启动器的「添加已有游戏」指向新目录')
+    return
+  }
   if (!confirm('把【完整整包】下载到一个新目录？\n不会改动当前安装；下完后可用官方启动器的「添加已有游戏」指向新目录。')) return
   await startDownload(gameId, true)
 }
