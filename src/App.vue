@@ -4,7 +4,48 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 
-const games = ref([])
+// ===== 区服：同一个游戏只显示一张卡，"国服 / 国际服"作为可选项 =====
+// 后端按 (游戏, 区服) 各给一个 id，前端把成对的合成一张卡，切换时用对应的 id 调后端。
+const REGION_PAIRS = {
+  genshin: { cn: 'genshin', global: 'genshin_global' },
+  starrail: { cn: 'starrail', global: 'starrail_global' },
+  zenless: { cn: 'zenless', global: 'zenless_global' },
+  wuthering_waves: { cn: 'wuthering_waves', global: 'wuthering_waves_global' },
+  pgr: { cn: 'pgr' }
+}
+const REGION_LABEL = { cn: '国服', global: '国际服' }
+// 每个"基名"当前选中的区服，记住上次选择
+const regionSel = ref(JSON.parse(localStorage.getItem('qlauncher_regions') || '{}'))
+function baseOf(id) {
+  for (const base of Object.keys(REGION_PAIRS)) {
+    const pair = REGION_PAIRS[base]
+    if (Object.values(pair).includes(id)) return base
+  }
+  return id
+}
+function setRegion(base, region) {
+  regionSel.value = { ...regionSel.value, [base]: region }
+  localStorage.setItem('qlauncher_regions', JSON.stringify(regionSel.value))
+}
+const rawGames = ref([])
+// 合并后的卡片列表：每张卡用"当前区服对应的那个后端 id"，其余字段原样
+const games = computed(() => {
+  const byId = {}
+  for (const g of rawGames.value) byId[g.id] = g
+  const out = []
+  const seen = new Set()
+  for (const g of rawGames.value) {
+    const base = baseOf(g.id)
+    if (seen.has(base)) continue
+    seen.add(base)
+    const pair = REGION_PAIRS[base]
+    const regions = pair ? Object.keys(pair).filter(r => byId[pair[r]]) : []
+    const region = regions.includes(regionSel.value[base]) ? regionSel.value[base] : (regions[0] || 'cn')
+    const active = pair && pair[region] && byId[pair[region]] ? byId[pair[region]] : g
+    out.push({ ...active, base_id: base, region, regions })
+  }
+  return out
+})
 const loading = ref(false)
 const runningGames = ref({})
 const remotes = ref({})
@@ -117,7 +158,7 @@ async function loadGames() {
   ]
   try {
     const installedGames = await invoke('get_installed_games')
-    games.value = [...baseGames, ...installedGames.map(g => ({
+    rawGames.value = [...baseGames, ...installedGames.map(g => ({
       ...g,
       status: g.installed ? '已安装' : '未安装'
     }))]
@@ -180,19 +221,28 @@ async function startDownload(gameId, forceFull = false) {
   if (isSophon) {
     if (!confirm(`🚀 ${game.name} 已启用 Sophon 增量更新引擎。\n\n会直接对账已安装目录，只下载差异文件块（不需要整包压缩包，也不需要选下载目录）。\n\n远程版本：v${r?.announced_version || r?.latest_version || '?'}\n\n确认开始更新？`)) return
   } else {
-    dest = await open({ directory: true, multiple: false, title: '选择下载保存目录' })
+    dest = await open({ directory: true, multiple: false,
+      title: game?.platform === 'kuro'
+        ? '选择《鸣潮》安装根目录（会在里面生成 Wuthering Waves.exe / Client/…）'
+        : '选择下载保存目录' })
     if (!dest) return
   }
-  const isPatch = !forceFull && !isSophon && r && r.patch_from && r.patch_from === game?.local_version
+  const isKuro = game?.platform === 'kuro'
+  // ⚠️ 必须显式转布尔：r.patch_from 可能是 null，&& 链会把 null 原样传给后端（Tauri 会拒 null）
+  const isPatch = !!(r && r.patch_from && r.patch_from === game?.local_version) && !forceFull && !isSophon
   let allowOld = false
   if (!isSophon) {
     if (r && r.version_relation === 'announced' && !forceFull) {
       if (!confirm(`⚠️ 官方已发布 v${r.announced_version}（来源：${r.version_source}），但接口整包只到 v${r.latest_version}。\n\n继续只会下载【旧版 v${r.latest_version}】，不会让你变成 v${r.announced_version}。\n要更新到最新版请用『🩺 官方更新』（拉起官方启动器）。\n\n仍要下载旧版整包吗？`)) return
       allowOld = true
     } else {
-      const warn = isPatch
-        ? `差分更新：下载约 ${fmtBytes(r.patch_size)}（另需临时空间解压），确认开始？`
-        : `整包安装：下载约 ${fmtBytes(r?.package_size || 0)}，解压后安装约 ${fmtBytes(r?.install_size || 0)}。\n\n⚠️ 目标盘需要同时容纳两者（约 ${fmtBytes((r?.package_size || 0) + (r?.install_size || 0))}），确认继续？`
+      const warn = isKuro
+        ? (isPatch
+            ? `《鸣潮》更新：只补本地对不上的文件，约 ${fmtBytes(r?.patch_size || 0)}（官方 md5 校验，直接落盘、无需解压）。\n\n确认继续？`
+            : `《鸣潮》整包安装：需要下载约 ${fmtBytes(r?.package_size || 0)}（官方清单 v${r?.latest_version || '?'}，按文件裸传、直接落盘、无需解压）。\n\n⚠️ 目标盘要留出这么多空间。确认继续？`)
+        : (isPatch
+            ? `差分更新：下载约 ${fmtBytes(r.patch_size)}（另需临时空间解压），确认开始？`
+            : `整包安装：下载约 ${fmtBytes(r?.package_size || 0)}，解压后安装约 ${fmtBytes(r?.install_size || 0)}。\n\n⚠️ 目标盘需要同时容纳两者（约 ${fmtBytes((r?.package_size || 0) + (r?.install_size || 0))}），确认继续？`)
       if (!confirm(warn)) return
     }
   }
@@ -238,6 +288,7 @@ onMounted(() => {
     }
     else if (p.status.startsWith('done:')) { 
       delete progress.value[p.game_id]
+      delete patchProgress.value[p.game_id]
       alert('下载/更新完成：' + p.status.slice(5)) 
       loadGames() // 🌟 完成后刷新游戏列表，更新本地版本号
     }
@@ -271,7 +322,8 @@ onMounted(() => {
 })
 
 async function loadOfficialInfo() {
-  const ids = games.value.filter(g => g.id !== 'test_notepad').map(g => g.id)
+  // 用 rawGames（所有区服都要拿到官启/官网信息），否则切区后按钮会消失
+  const ids = rawGames.value.filter(g => g.id !== 'test_notepad').map(g => g.id)
   const res = await Promise.all(ids.map(id =>
     invoke('official_info', { gameId: id }).catch(() => null)
   ))
@@ -331,7 +383,7 @@ async function killZombie(pid) {
 }
 
 async function loadPatchState() {
-  const ids = games.value.filter(g => g.id !== 'test_notepad').map(g => g.id)
+  const ids = rawGames.value.filter(g => g.id !== 'test_notepad').map(g => g.id)
   const res = await Promise.all(ids.map(id => invoke('patch_status', { gameId: id }).catch(() => null)))
   ids.forEach((id, i) => { if (res[i]) patchState.value[id] = res[i]; else delete patchState.value[id] })
 }
@@ -354,13 +406,17 @@ async function rollbackPatch(gameId) {
 }
 
 async function verifyRepair(gameId) {
+  const game = games.value.find(g => g.id === gameId)
+  const isKuro = game?.platform === 'kuro'
   const isSophon = (gameId === 'genshin' || gameId === 'starrail')
-  // Sophon 游戏：校验就是"拉官方分块清单对账"，没有快/深之分
-  const deep = isSophon ? true
+  // Sophon / 库洛：校验都是"拉官方清单对账"，没有快/深之分
+  const deep = (isSophon || isKuro) ? true
     : !confirm('校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
   patchBusy.value = gameId
   patchBusyStart.value = Date.now()
-  patchProgress.value[gameId] = isSophon ? 'Sophon 对账：拉官方分块清单…' : (deep ? '深度校验：逐文件算 md5…' : '快速校验：比对文件大小…')
+  patchProgress.value[gameId] = isSophon ? 'Sophon 对账：拉官方分块清单…'
+    : isKuro ? '库洛对账：拉官方清单…'
+    : (deep ? '深度校验：逐文件算 md5…' : '快速校验：比对文件大小…')
   progress.value[gameId] = { downloaded: 0, total: 0, speed: 0, eta_seconds: null, status: 'verifying' }
   try {
     const r = await invoke('verify_game_files', { gameId, deep })
@@ -369,7 +425,7 @@ async function verifyRepair(gameId) {
     delete progress.value[gameId]
     const head = `清单来源：${r.manifest}\n共 ${r.total} 项 → 正常 ${r.ok} ｜ 缺失 ${r.missing} ｜ 大小不符 ${r.size_bad} ｜ md5 不符 ${r.md5_bad}\n` +
       `需要补下：${fmtBytes(r.broken_bytes)}\n本地 v${r.local_version} ｜ 接口 v${r.remote_version} ｜ 版本${r.version_match ? '一致 ✅' : '不一致 ⚠️'}\n` +
-      `散列地址：${r.res_list_url || (r.sophon_managed ? '（Sophon 分块体系 → 走分块补全）' : '（无 → 无法单文件补全）')}`
+      `散列地址：${r.res_list_url || (r.sophon_managed ? '（Sophon 分块体系 → 走分块补全）' : isKuro ? '（库洛官方清单 → 差异文件重下）' : '（无 → 无法单文件补全）')}`
     const list = r.sample.length ? `\n\n前 ${r.sample.length} 条：\n` + r.sample.join('\n') : ''
     const broken = r.missing + r.size_bad + r.md5_bad
     // Sophon 体系：不走逐文件 URL 补全（那会用旧整包地址把新版本文件降级），直接引导到分块更新
@@ -377,6 +433,12 @@ async function verifyRepair(gameId) {
       if (broken === 0) { alert(head + '\n\n✅ 与官方分块清单完全一致。'); return }
       if (!confirm(head + list + `\n\n原神/星铁走 Sophon 分块体系：这 ${broken} 个差异文件要由分块引擎补（逐文件补全会用旧整包地址把文件搞乱，已禁用）。\n\n现在就开始分块更新吗？`)) return
       return startDownload(gameId)
+    }
+    // 库洛（鸣潮）：官方清单对账 → 差异文件重下（分块续传 + 官方 md5 校验，作用在已绑定目录）
+    if (isKuro) {
+      if (broken === 0) { alert(head + '\n\n✅ 与官方清单完全一致。'); return }
+      if (!confirm(head + list + `\n\n《鸣潮》按官方清单补：这 ${broken} 个文件会重新下载（逐块 + 整文件官方 md5 校验，直接落到已绑定目录）。\n\n现在开始吗？`)) return
+      return kuroRepair(gameId)
     }
     if (broken === 0) { alert(head + '\n\n✅ 没有发现问题文件。'); return }
     if (!r.res_list_url) { alert(head + list + '\n\n⚠️ 该版本没有散列文件地址，无法按单文件补全 —— 请用『🩺 官方修复』或整包。'); return }
@@ -392,6 +454,16 @@ async function verifyRepair(gameId) {
     const msg = String(e)
     alert(msg.includes('已取消') ? '⏹ ' + msg : '校验/修复失败: ' + msg)
   }
+}
+
+// 库洛修复：dest 传空 → 后端用「已绑定目录」，不再弹选目录
+async function kuroRepair(gameId) {
+  patchBusy.value = gameId
+  patchBusyStart.value = Date.now()
+  progress.value[gameId] = { downloaded: 0, total: 0, speed: 0, eta_seconds: null, status: 'downloading' }
+  try {
+    await invoke('start_download', { gameId, dest: '', usePatch: false, allowOld: false })
+  } catch (e) { delete progress.value[gameId]; alert('启动修复失败: ' + e) }
 }
 
 async function officialRepair(gameId) {
@@ -463,7 +535,12 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
             {{ game.platform_level === 'Aggregate' ? '📦' : game.platform_level === 'DirectLaunch' ? '🚀' : '💎' }}
           </div>
           <div class="game-info">
-            <h3>{{ game.name }}</h3>
+            <h3>{{ game.name }}<span v-if="game.regions && game.regions.length > 1" class="region-switch">
+              <button v-for="rg in game.regions" :key="rg"
+                      :class="{ on: game.region === rg }"
+                      :title="'切换到' + REGION_LABEL[rg]"
+                      @click.stop="setRegion(game.base_id, rg)">{{ REGION_LABEL[rg] }}</button>
+            </span></h3>
             <span class="status">
               <span class="level-badge" :class="game.platform_level === 'Aggregate' ? 'l0' : game.platform_level === 'DirectLaunch' ? 'l1' : 'l3'">
                 {{ game.platform_level }}
@@ -499,7 +576,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               <button v-if="canDownload(game) && !progress[game.id]" class="action-btn mini dl" @click.stop="startDownload(game.id)">{{ downloadLabel(game) }}</button>
               <button v-if="progress[game.id]" class="action-btn mini cancel" @click.stop="cancelDownload(game.id)">✖ 取消</button>
               <button v-if="game.status === '已安装' && game.platform === 'mihoyo'" class="action-btn mini" @click.stop="applyPatch(game.id)">🔧 应用差分</button>
-              <button v-if="game.status === '已安装' && game.platform === 'mihoyo'" class="action-btn mini" @click.stop="verifyRepair(game.id)">🩹 校验修复</button>
+              <button v-if="game.status === '已安装' && (game.platform === 'mihoyo' || game.platform === 'kuro')" class="action-btn mini" @click.stop="verifyRepair(game.id)">🩹 校验修复</button>
             </template>
           </div>
           <div v-if="progress[game.id]" class="progress-wrap">           
@@ -559,6 +636,12 @@ h1 { color: #4a9eff; margin: 0 0 10px 0; }
 .action-btn.kill:hover { background: #b71c1c; }
 .progress-wrap { width: 100%; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .progress-bar { width: 45%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
+.region-switch { margin-left: 10px; display: inline-flex; gap: 2px; vertical-align: middle; }
+.region-switch button {
+  font-size: 12px; padding: 1px 8px; border-radius: 10px; cursor: pointer;
+  background: #2a2a33; color: #aaa; border: 1px solid #3a3a44;
+}
+.region-switch button.on { background: #2d6cdf; color: #fff; border-color: #2d6cdf; }
 .progress-fill { height: 100%; background: #4caf50; transition: width 0.3s; }
 .progress-stats { display: flex; justify-content: space-between; font-size: 12px; color: #aaa; width: 100%; }
 .progress-stats .speed { color: #4a9eff; font-weight: bold; }

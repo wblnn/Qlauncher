@@ -14,14 +14,58 @@ use tauri::{Emitter, Manager};
 
 
 const HYP_BASE_CN: &str = "https://hyp-api.mihoyo.com/hyp/hyp-connect/api";
+const HYP_BASE_GLOBAL: &str = "https://sg-hyp-api.hoyoverse.com/hyp/hyp-connect/api";
 const HYP_LAUNCHER_ID_CN: &str = "jGHBHlcOq1";
+const HYP_LAUNCHER_ID_GLOBAL: &str = "VYTpXlbWo8";
 const HYP_LANGUAGE: &str = "zh-cn";
 
-const MIHOYO_GAMES: &[(&str, &str, &str, &[&str])] = &[
-    ("genshin", "原神", "hk4e_cn", &["YuanShen.exe", "GenshinImpact.exe"]),
-    ("starrail", "崩坏：星穹铁道", "hkrpg_cn", &["StarRail.exe"]),
-    ("zenless", "绝区零", "nap_cn", &["ZenlessZoneZero.exe"]),
+/// 一个米哈游游戏（**按区服各一条**：国服 / 国际服）。
+/// 前端把同名两条合成"一张卡 + 区域切换"，后端只认 id，不需要别的参数。
+pub struct MihoyoGame {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub biz: &'static str,
+    pub exes: &'static [&'static str],
+    /// "cn" | "global"
+    pub region: &'static str,
+    /// 注册表/目录名匹配关键字（国服用中文名，国际服用英文名）
+    pub hints: &'static [&'static str],
+    pub website: &'static str,
+}
+
+pub const MIHOYO_GAMES: &[MihoyoGame] = &[
+    MihoyoGame { id: "genshin", name: "原神", biz: "hk4e_cn",
+        exes: &["YuanShen.exe", "GenshinImpact.exe"], region: "cn",
+        hints: &["原神"], website: "https://ys.mihoyo.com/" },
+    MihoyoGame { id: "genshin_global", name: "原神", biz: "hk4e_global",
+        exes: &["GenshinImpact.exe"], region: "global",
+        hints: &["Genshin Impact"], website: "https://genshin.hoyoverse.com/" },
+    MihoyoGame { id: "starrail", name: "崩坏：星穹铁道", biz: "hkrpg_cn",
+        exes: &["StarRail.exe"], region: "cn",
+        hints: &["崩坏：星穹铁道", "星穹铁道"], website: "https://sr.mihoyo.com/" },
+    MihoyoGame { id: "starrail_global", name: "崩坏：星穹铁道", biz: "hkrpg_global",
+        exes: &["StarRail.exe"], region: "global",
+        hints: &["Honkai: Star Rail", "Honkai Star Rail"], website: "https://hsr.hoyoverse.com/" },
+    MihoyoGame { id: "zenless", name: "绝区零", biz: "nap_cn",
+        exes: &["ZenlessZoneZero.exe"], region: "cn",
+        hints: &["绝区零"], website: "https://zzz.mihoyo.com/" },
+    MihoyoGame { id: "zenless_global", name: "绝区零", biz: "nap_global",
+        exes: &["ZenlessZoneZero.exe"], region: "global",
+        hints: &["Zenless Zone Zero"], website: "https://zzz.hoyoverse.com/" },
 ];
+
+/// 按 id 取表项（区服/渠道/官网都在里面）
+fn mihoyo_def(game_id: &str) -> Option<&'static MihoyoGame> {
+    MIHOYO_GAMES.iter().find(|g| g.id == game_id)
+}
+/// 区服 → hyp-connect 基址（两服均已实测可用）
+fn hyp_base(region: &str) -> &'static str {
+    if region == "global" { HYP_BASE_GLOBAL } else { HYP_BASE_CN }
+}
+/// 区服 → 内置 launcher_id（国服 jGHBHlcOq1 / 国际服 VYTpXlbWo8，均实测可用）
+fn builtin_launcher_id(region: &str) -> &'static str {
+    if region == "global" { HYP_LAUNCHER_ID_GLOBAL } else { HYP_LAUNCHER_ID_CN }
+}
 
 #[derive(Deserialize)]
 pub struct ChannelsFile {
@@ -46,7 +90,7 @@ pub struct ChannelsFile {
 }
 
 /// 配置三级来源：项目源码（开发期主配置，改文件即时生效）→ 用户目录（生产覆盖）→ 内置默认
-fn channels_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+pub fn channels_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("channels.json");
     if project.is_file() { return Some(project); }
     if let Ok(dir) = app.path().app_data_dir() {
@@ -72,10 +116,9 @@ fn epoch_ms() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
-/// 拼接口地址（带 cache-buster，避免边缘缓存给旧数据）。
-/// extra 里的参数会拼成 `&k=v`，所以 game_id 这类查询参数必须走这里，不能塞进 path。
-fn hyp_url(path: &str, launcher_id: &str, extra: &[(&str, &str)]) -> String {
-    let mut u = format!("{}/{}?launcher_id={}&language={}&_={}", HYP_BASE_CN, path, launcher_id, HYP_LANGUAGE, epoch_ms());
+/// 拼接口地址（带 cache-buster）。base 由区服决定，extra 里的参数拼成 `&k=v`。
+fn hyp_url(base: &str, path: &str, launcher_id: &str, extra: &[(&str, &str)]) -> String {
+    let mut u = format!("{}/{}?launcher_id={}&language={}&_={}", base, path, launcher_id, HYP_LANGUAGE, epoch_ms());
     for (k, v) in extra { u.push_str(&format!("&{}={}", k, v)); }
     u
 }
@@ -102,26 +145,31 @@ fn local_launcher_id() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// launcher_id 候选（按优先级去重）：channels.json → 本机 HoYoPlay 日志 → 内置常量
-fn launcher_candidates(app: &tauri::AppHandle) -> Vec<(String, String)> {
+/// launcher_id 候选（按优先级去重）：本区服内置常量 → 本机 HoYoPlay 日志(国服) → channels.json 覆盖。
+/// 每个候选都会用 getGames 验证，区服不对的自然会被刷掉。
+fn launcher_candidates(app: &tauri::AppHandle, region: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     fn push(id: &str, src: &str, out: &mut Vec<(String, String)>) {
         let id = id.trim().to_string();
         if !id.is_empty() && !out.iter().any(|(x, _)| *x == id) { out.push((id, src.to_string())); }
     }
+    push(builtin_launcher_id(region),
+        if region == "global" { "内置国际服常量" } else { "内置国服常量" }, &mut out);
+    if region != "global" {
+        if let Some(id) = local_launcher_id() { push(&id, "本机 HoYoPlay 日志", &mut out); }
+    }
     let cfg = read_channels(app);
     if let Some(ids) = cfg.launcher_ids { for id in ids { push(&id, "channels.json(launcher_ids)", &mut out); } }
     if let Some(id) = cfg.launcher_id { push(&id, "channels.json(launcher_id)", &mut out); }
-    if let Some(id) = local_launcher_id() { push(&id, "本机 HoYoPlay 日志", &mut out); }
-    push(HYP_LAUNCHER_ID_CN, "内置常量", &mut out);
     out
 }
 
 /// 逐个候选打 getGames，选第一个能用的；顺带拿到 biz↔game_id 映射
-fn hyp_resolve(app: &tauri::AppHandle) -> Result<(String, String, Vec<HypGameEntry>), String> {
+fn hyp_resolve(app: &tauri::AppHandle, region: &str) -> Result<(String, String, Vec<HypGameEntry>), String> {
+    let base = hyp_base(region);
     let mut tried: Vec<String> = Vec::new();
-    for (id, src) in launcher_candidates(app) {
-        match hyp_get::<HypRoot<HypGamesData>>(&hyp_url("getGames", &id, &[])) {
+    for (id, src) in launcher_candidates(app, region) {
+        match hyp_get::<HypRoot<HypGamesData>>(&hyp_url(base, "getGames", &id, &[])) {
             Ok(root) if root.retcode == 0 => {
                 let games = root.data.map(|d| d.games).unwrap_or_default();
                 if !games.is_empty() { return Ok((id, src, games)); }
@@ -131,7 +179,7 @@ fn hyp_resolve(app: &tauri::AppHandle) -> Result<(String, String, Vec<HypGameEnt
             Err(e) => tried.push(format!("{} -> {}", id, e)),
         }
     }
-    Err(format!("所有 launcher_id 候选都失败了：\n{}", tried.join("\n")))
+    Err(format!("所有 launcher_id 候选都失败了（区服 {}）：\n{}", region, tried.join("\n")))
 }
 
 /// 按匹配规则在 getGames 结果里找游戏（米哈游改渠道名/加马甲也能跟上）
@@ -139,8 +187,12 @@ fn match_biz(app: &tauri::AppHandle, game_id: &str, games: &[HypGameEntry]) -> O
     let cfg = read_channels(app);
     let mut pats: Vec<String> = cfg.biz_patterns.as_ref().and_then(|m| m.get(game_id)).cloned().unwrap_or_default();
     if pats.is_empty() {
-        pats = MIHOYO_GAMES.iter().find(|(id, _, _, _)| *id == game_id)
-            .map(|(_, name, biz, _)| vec![biz.to_string(), name.to_string()])
+        pats = mihoyo_def(game_id)
+            .map(|g| {
+                let mut v = vec![g.biz.to_string(), g.name.to_string()];
+                v.extend(g.hints.iter().map(|h| h.to_string()));
+                v
+            })
             .unwrap_or_default();
     }
     let lower: Vec<String> = pats.iter().map(|p| p.to_lowercase()).collect();
@@ -189,6 +241,25 @@ fn announced_from_posts(posts: &[HypPost]) -> Option<String> {
         }
     }
     best.map(|(a, b, c)| format!("{}.{}.{}", a, b, c))
+}
+
+/// 从 getGameBranches 取某渠道的**权威 tag**——国服/国际服都实测可用，
+/// 比"公告标题推断"硬得多（星铁 4.6.0 / 原神 7.1.0 都能直接读到）。
+fn branches_tag(base: &str, launcher_id: &str, biz: &str) -> Option<String> {
+    #[derive(Deserialize, Default)]
+    struct BrGame { #[serde(default)] biz: String }
+    #[derive(Deserialize, Default)]
+    struct BrMain { #[serde(default)] tag: String }
+    #[derive(Deserialize, Default)]
+    struct Br { #[serde(default)] game: BrGame, #[serde(default)] main: Option<BrMain> }
+    #[derive(Deserialize, Default)]
+    struct BrData { #[serde(default)] game_branches: Vec<Br> }
+    let root: HypRoot<BrData> = hyp_get(&hyp_url(base, "getGameBranches", launcher_id, &[])).ok()?;
+    root.data?.game_branches.into_iter()
+        .find(|b| b.game.biz == biz)
+        .and_then(|b| b.main)
+        .map(|m| m.tag)
+        .filter(|t| !t.is_empty())
 }
 
 /// 保留旧签名（自检报告等处仍用它做"当前配置里写的 launcher_id"展示）
@@ -397,7 +468,7 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
 }
 
 /// 目标路径所在卷的可用空间（用 sysinfo::Disks，不引新依赖）
-fn free_space_of(path: &Path) -> Option<u64> {
+pub fn free_space_of(path: &Path) -> Option<u64> {
     use sysinfo::Disks;
     let p = path.to_string_lossy().to_lowercase();
     let disks = Disks::new_with_refreshed_list();
@@ -500,11 +571,11 @@ fn manifest_entries(dir: &str) -> Result<Vec<ManifestEntry>, String> {
 /// Sophon 体系（原神/星铁）的校验：本地 pkg_version 清单在 Sophon 更新后会过期，
 /// 拿它比对会满屏假阳性 —— 所以改成拉官方分块清单、与本地逐文件对账（这套体系下"校验"的正确口径）。
 fn verify_sophon(app: &tauri::AppHandle, game_id: &str, game_dir: &str) -> Result<VerifyReport, String> {
-    let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
+    let biz = mihoyo_def(game_id).map(|g| g.biz).ok_or("未知的米哈游游戏")?;
     // 取消支持：界面『✖ 取消』会置这个标志，对账过程每文件检查一次
     let cancel = crate::cancel_flag(game_id);
     cancel.store(false, AtomicOrdering::SeqCst);
-    let lid = match hyp_resolve(app) { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
+    let lid = match hyp_resolve(app, "cn") { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
     let client = crate::sophon::blocking_client();
     let category = read_channels(app).sophon_categories
         .and_then(|v| v.into_iter().next())
@@ -1394,106 +1465,54 @@ fn emit(report: &mut Vec<String>, line: String) {
 }
 
 pub fn probe_report(app: &tauri::AppHandle) -> Vec<String> {
-    let (launcher_id, source) = hyp_launcher_id(app);
+    let (cfg_lid, source) = hyp_launcher_id(app);
     let mut report = Vec::new();
     emit(&mut report, "[0] 接口底座 hyp-connect（旧 mdk 接口已失效：retcode -205 invalid key）".into());
-    emit(&mut report, format!("[0] launcher_id = {}（来源：{}）", launcher_id, source));
+    emit(&mut report, format!("[0] 内置常量：国服 {} / 国际服 {}；channels.json 覆盖值 = {}（来源：{}）",
+        HYP_LAUNCHER_ID_CN, HYP_LAUNCHER_ID_GLOBAL, cfg_lid, source));
     emit(&mut report, format!("[0] 下载保命线 = {} MB（0=不限）", download_limit_bytes(app) / 1024 / 1024));
     emit(&mut report, format!("[0] channels.json = {}",
         channels_path(app).map(|p| p.display().to_string())
             .unwrap_or_else(|| "（未找到，用内置默认）".into())));
 
-    let games_url = format!("{}/getGames?launcher_id={}&language={}", HYP_BASE_CN, launcher_id, HYP_LANGUAGE);
-    let mut id_by_biz: HashMap<String, String> = HashMap::new();
-    match hyp_get::<HypRoot<HypGamesData>>(&games_url) {
-        Ok(root) if root.retcode == 0 => {
-            let games = root.data.map(|d| d.games).unwrap_or_default();
-            emit(&mut report, format!("[1] getGames retcode=0 → 返回 {} 个游戏", games.len()));
-            for g in &games { id_by_biz.insert(g.biz.clone(), g.id.clone()); }
-            for (id, name, biz, _) in MIHOYO_GAMES {
-                let gid = id_by_biz.get(*biz).map(|s| s.as_str()).unwrap_or("未返回");
-                emit(&mut report, format!("      {} / {} → biz={} id={}", id, name, biz, gid));
-            }
-        }
-        Ok(root) => emit(&mut report, format!("[1] getGames retcode={} message={}", root.retcode, root.message)),
-        Err(e) => emit(&mut report, format!("[1] getGames 请求失败: {}", e)),
-    }
-
-    let pkgs_url = format!("{}/getGamePackages?launcher_id={}&language={}", HYP_BASE_CN, launcher_id, HYP_LANGUAGE);
-    match hyp_get::<HypRoot<HypPackagesData>>(&pkgs_url) {
-        Ok(root) if root.retcode == 0 => {
-            let list = root.data.map(|d| d.game_packages).unwrap_or_default();
-            emit(&mut report, format!("[2] getGamePackages retcode=0 → 返回 {} 个游戏的包信息", list.len()));
-            for (id, name, biz, _) in MIHOYO_GAMES {
-                match list.iter().find(|g| g.game.biz == *biz) {
-                    Some(gp) => match gp.main.as_ref().and_then(|m| m.major.as_ref()) {
-                        Some(m) => {
-                            let total: u64 = m.game_pkgs.iter().filter_map(|p| p.size.parse::<u64>().ok()).sum();
-                            let patch = gp.main.as_ref().and_then(|m| m.patches.first())
-                                .map(|p| format!("；差分 from {} ({})", p.version,
-                                    crate::fmt_size(p.game_pkgs.iter().filter_map(|x| x.size.parse::<u64>().ok()).sum())))
-                                .unwrap_or_else(|| "；无差分包".to_string());
-                            emit(&mut report, format!("      {} / {} v{} 整包 {} 卷 / {}{}",
-                                id, name, m.version, m.game_pkgs.len(), crate::fmt_size(total), patch));
-                        }
-                        None => emit(&mut report, format!("      {} / {}：接口未给整包", id, name)),
-                    },
-                    None => emit(&mut report, format!("      {} / {}：接口未返回 {} 的包", id, name, biz)),
+    let cfg = crate::load_config(app);
+    // 两个区服各跑一遍：谁用哪个 launcher_id、渠道映射、整包/预下载/分支tag、最终判定
+    for region in ["cn", "global"] {
+        let label = if region == "global" { "国际服" } else { "国服" };
+        let base = hyp_base(region);
+        let (lid, lsrc, games) = match hyp_resolve(app, region) {
+            Ok(v) => v,
+            Err(e) => { emit(&mut report, format!("[{}] ⚠️ launcher_id 解析失败：{}", label, e)); continue; }
+        };
+        emit(&mut report, format!("[{}] launcher_id = {}（来源：{}；候选 {} 个）→ getGames 返回 {} 个游戏",
+            label, lid, lsrc, launcher_candidates(app, region).len(), games.len()));
+        match hyp_get::<HypRoot<HypPackagesData>>(&hyp_url(base, "getGamePackages", &lid, &[])) {
+            Ok(root) if root.retcode == 0 => {
+                let list = root.data.map(|d| d.game_packages).unwrap_or_default();
+                for g in MIHOYO_GAMES.iter().filter(|g| g.region == region) {
+                    let matched = match_biz(app, g.id, &games);
+                    let gid = matched.as_ref().map(|m| m.1.clone()).unwrap_or_else(|| "未匹配".into());
+                    let gp = matched.as_ref().and_then(|m| list.iter().find(|x| x.game.biz == m.0));
+                    let pkg = gp.and_then(|x| x.main.as_ref()).and_then(|m| m.major.as_ref())
+                        .map(|m| m.version.clone()).unwrap_or_else(|| "无".into());
+                    let pre = gp.and_then(|x| x.pre_download.as_ref()).and_then(|p| p.major.as_ref())
+                        .map(|m| m.version.clone()).unwrap_or_else(|| "无".into());
+                    let tag = branches_tag(base, &lid, &g.biz).unwrap_or_else(|| "无".into());
+                    let local = cfg.get(g.id).cloned()
+                        .and_then(|d| crate::read_local_version(&d)).unwrap_or_else(|| "未安装".into());
+                    let best = if tag != "无" { tag.clone() } else { pkg.clone() };
+                    let verdict = if local == "未安装" { "未安装（可整包）".to_string() }
+                        else if compare_versions(&local, &best) == Ordering::Less { "可更新".to_string() }
+                        else if compare_versions(&local, &best) == Ordering::Greater { "本地更新（接口滞后）".to_string() }
+                        else { "已是最新".to_string() };
+                    emit(&mut report, format!(
+                        "      {} / {}（{}）→ biz={} id={} ｜ 本地 {} ｜ 整包 {} ｜ 预下载 {} ｜ 分支tag {} ｜ 判定：{}",
+                        g.id, g.name, label, g.biz, gid, local, pkg, pre, tag, verdict));
                 }
             }
-            for gp in &list {
-                let major = match gp.main.as_ref().and_then(|m| m.major.as_ref()) { Some(m) => m, None => continue };
-                let gid = id_by_biz.get(&gp.game.biz).map(|s| s.as_str()).unwrap_or(gp.game.id.as_str());
-                let sources: Vec<String> = gp.main.as_ref()
-                    .map(|m| m.patches.iter().map(|p| format!("\"{}\"", p.version)).collect())
-                    .unwrap_or_default();
-                emit(&mut report, format!("[全量] biz={} id={} major={} 差分源=[{}] res_list={}",
-                    gp.game.biz, gid, major.version, sources.join(", "), major.res_list_url));
-            }
+            Ok(root) => emit(&mut report, format!("[{}] getGamePackages retcode={} message={}", label, root.retcode, root.message)),
+            Err(e) => emit(&mut report, format!("[{}] getGamePackages 请求失败: {}", label, e)),
         }
-        Ok(root) => emit(&mut report, format!("[2] getGamePackages retcode={} message={}", root.retcode, root.message)),
-        Err(e) => emit(&mut report, format!("[2] getGamePackages 请求失败: {}", e)),
-    }
-
-    // [3] 版本源对账：整包（唯一可下载）/ 预下载 / 公告推断 → 最终判定 + 实际用的渠道与 launcher_id
-    emit(&mut report, "[3] 版本源对账（整包=唯一可下载；公告=判断是否已落后真实版本）".into());
-    match hyp_resolve(app) {
-        Ok((lid, lsrc, games)) => {
-            emit(&mut report, format!("      launcher_id = {}（来源：{}；候选共 {} 个）", lid, lsrc, launcher_candidates(app).len()));
-            let cfg = crate::load_config(app);
-            match hyp_get::<HypRoot<HypPackagesData>>(&hyp_url("getGamePackages", &lid, &[])) {
-                Ok(root) if root.retcode == 0 => {
-                    let list = root.data.map(|d| d.game_packages).unwrap_or_default();
-                    for (id, name, _biz, _) in MIHOYO_GAMES {
-                        let (biz, gid) = match match_biz(app, id, &games) {
-                            Some(v) => v,
-                            None => { emit(&mut report, format!("      {} / {}：渠道未匹配到（需改 channels.json 的 biz_patterns）", id, name)); continue; }
-                        };
-                        let gp = match list.iter().find(|g| g.game.biz == biz) {
-                            Some(g) => g,
-                            None => { emit(&mut report, format!("      {} / {}：接口未返回 {} 的包", id, name, biz)); continue; }
-                        };
-                        let pkg = gp.main.as_ref().and_then(|m| m.major.as_ref()).map(|m| m.version.clone()).unwrap_or_default();
-                        let pre = gp.pre_download.as_ref().and_then(|p| p.major.as_ref()).map(|m| m.version.clone()).unwrap_or_else(|| "无".into());
-                        let ann = hyp_get::<HypRoot<HypContentData>>(&hyp_url("getGameContent", &lid, &[("game_id", gid.as_str())]))
-                            .ok().and_then(|r| r.data).and_then(|d| d.content)
-                            .and_then(|c| announced_from_posts(&c.posts)).unwrap_or_else(|| "无".into());
-                        let local = cfg.get(*id).cloned()
-                            .and_then(|d| crate::read_local_version(&d)).unwrap_or_else(|| "未安装".into());
-                        let verdict = if local == "未安装" { "未安装（可整包）".to_string() }
-                            else if compare_versions(&local, &pkg) == Ordering::Less { "可更新（整包）".to_string() }
-                            else if compare_versions(&local, &pkg) == Ordering::Greater { "本地更新 → 接口整包滞后，禁下载".to_string() }
-                            else if ann != "无" && compare_versions(&ann, &pkg) == Ordering::Greater { format!("⚠️ 整包停更：官宣 {} > 整包 {} → 请走官启", ann, pkg) }
-                            else { "已是最新".to_string() };
-                        emit(&mut report, format!("      {} / {} → biz={} id={} ｜ 本地 {} ｜ 整包 {} ｜ 预下载 {} ｜ 公告 {} ｜ 判定：{}",
-                            id, name, biz, gid, local, pkg, pre, ann, verdict));
-                    }
-                }
-                Ok(root) => emit(&mut report, format!("      getGamePackages retcode={} {}", root.retcode, root.message)),
-                Err(e) => emit(&mut report, format!("      getGamePackages 失败: {}", e)),
-            }
-        }
-        Err(e) => emit(&mut report, format!("      ⚠️ launcher_id 全部候选都失败：{}", e)),
     }
     report
 }
@@ -1504,53 +1523,45 @@ impl GamePlatform for MihoyoPlatform {
     fn id(&self) -> &str { "mihoyo" }
     fn name(&self) -> &str { "米哈游 (Full)" }
     fn level(&self) -> PlatformLevel { PlatformLevel::Full }
-    fn game_ids(&self) -> Vec<&'static str> { vec!["genshin", "starrail", "zenless"] }
+    fn game_ids(&self) -> Vec<&'static str> { MIHOYO_GAMES.iter().map(|g| g.id).collect() }
     fn official_launcher(&self) -> Option<String> { Some("https://ys.mihoyo.com/".into()) }
     fn official_website(&self, game_id: &str) -> Option<String> {
-        Some(match game_id {
-            "genshin" => "https://ys.mihoyo.com/",
-            "starrail" => "https://sr.mihoyo.com/",
-            "zenless" => "https://zzz.mihoyo.com/",
-            _ => return None,
-        }.into())
+        mihoyo_def(game_id).map(|g| g.website.to_string())
     }
 
     // P3：平台自己声明 exe 候选名
     fn exe_candidates(&self, game_id: &str) -> Vec<&'static str> {
-        MIHOYO_GAMES.iter()
-            .find(|(id, _, _, _)| *id == game_id)
-            .map(|(_, _, _, exes)| exes.to_vec())
-            .unwrap_or_default()
+        mihoyo_def(game_id).map(|g| g.exes.to_vec()).unwrap_or_default()
     }
 
     fn detect(&self, app: &tauri::AppHandle) -> Vec<GameInfo> {
         let cfg = crate::load_config(app);
         let entries = crate::scan_uninstall_registry();
         let mut games = Vec::new();
-        for (id, cname, _biz, exes) in MIHOYO_GAMES {
+        for g in MIHOYO_GAMES {
             let mut found: Option<(String, PathBuf)> = None;
-            if let Some(dir) = cfg.get(*id) {
-                if let Some(exe) = crate::find_game_exe(Path::new(dir), exes) { found = Some((dir.clone(), exe)); }
+            if let Some(dir) = cfg.get(g.id) {
+                if let Some(exe) = crate::find_game_exe(Path::new(dir), g.exes) { found = Some((dir.clone(), exe)); }
             }
             if found.is_none() {
                 for (name, loc) in &entries {
-                    if crate::is_cloud_entry(name) || !name.contains(cname) { continue; }
+                    if crate::is_cloud_entry(name) || !g.hints.iter().any(|h| name.contains(h)) { continue; }
                     let dir = Path::new(loc);
                     if !dir.exists() { continue; }
-                    if let Some(exe) = crate::find_game_exe(dir, exes) { found = Some((loc.clone(), exe)); break; }
+                    if let Some(exe) = crate::find_game_exe(dir, g.exes) { found = Some((loc.clone(), exe)); break; }
                 }
             }
             games.push(match found {
                 Some((dir, exe)) => GameInfo {
-                    id: (*id).into(), name: (*cname).into(), installed: true,
+                    id: g.id.into(), name: g.name.into(), installed: true,
                     path: Some(dir.clone()), exe: Some(exe.to_string_lossy().into_owned()),
                     local_version: crate::read_local_version(&dir), platform: "mihoyo".into(),
-                    platform_level: PlatformLevel::Full, launcher_uri: self.official_launcher(),
+                    platform_level: PlatformLevel::Full, launcher_uri: Some(g.website.to_string()),
                 },
                 None => GameInfo {
-                    id: (*id).into(), name: (*cname).into(), installed: false,
+                    id: g.id.into(), name: g.name.into(), installed: false,
                     path: None, exe: None, local_version: None, platform: "mihoyo".into(),
-                    platform_level: PlatformLevel::Full, launcher_uri: self.official_launcher(),
+                    platform_level: PlatformLevel::Full, launcher_uri: Some(g.website.to_string()),
                 },
             });
         }
@@ -1565,8 +1576,11 @@ impl GamePlatform for MihoyoPlatform {
     }
 
     fn remote_info(&self, app: &tauri::AppHandle, game_id: &str) -> Result<RemoteGameInfo, String> {
+        let def = mihoyo_def(game_id).ok_or("未知的米哈游游戏")?;
+        let region = def.region;
+        let base = hyp_base(region);
         // ① 解析 launcher_id（逐个候选验证）+ 动态匹配渠道（渠道改名也能跟上）
-        let (launcher_id, lid_src, games) = hyp_resolve(app)?;
+        let (launcher_id, lid_src, games) = hyp_resolve(app, region)?;
         let (biz, hyp_game_id) = match match_biz(app, game_id, &games) {
             Some(v) => v,
             None => {
@@ -1577,7 +1591,7 @@ impl GamePlatform for MihoyoPlatform {
             }
         };
         // ② 整包信息（带 cache-buster）
-        let root: HypRoot<HypPackagesData> = hyp_get(&hyp_url("getGamePackages", &launcher_id, &[]))?;
+        let root: HypRoot<HypPackagesData> = hyp_get(&hyp_url(base, "getGamePackages", &launcher_id, &[]))?;
         if root.retcode != 0 {
             return Err(format!("getGamePackages retcode={} message={}（launcher_id={} 来源：{}）", root.retcode, root.message, launcher_id, lid_src));
         }
@@ -1606,7 +1620,7 @@ impl GamePlatform for MihoyoPlatform {
         // ③ 公告/预下载推断"当前真实版本"
         let mut announce_err: Option<String> = None;
         let mut announced = match hyp_get::<HypRoot<HypContentData>>(
-                &hyp_url("getGameContent", &launcher_id, &[("game_id", hyp_game_id.as_str())])) {
+                &hyp_url(base, "getGameContent", &launcher_id, &[("game_id", hyp_game_id.as_str())])) {
             Ok(r) if r.retcode == 0 => match r.data.and_then(|d| d.content).and_then(|c| announced_from_posts(&c.posts)) {
                 Some(v) => Some(v),
                 None => { announce_err = Some("公告里没解析出版本号".into()); None }
@@ -1618,27 +1632,16 @@ impl GamePlatform for MihoyoPlatform {
         // 🌟 显式标注 &str 类型，避免生命周期推断报错
         let mut announced_src: &str = "公告(推断)";
 
-                // 🌟 Sophon 权威版本：原神/星铁直接取 getBuild 的 tag（公告解析失败不再阻断更新）
-        if game_id == "genshin" || game_id == "starrail" {
-            let lid = launcher_id.clone();
-            let bz = biz.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::sophon::fetch_latest_tag(&lid, &bz));
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(20)) {
-                Ok(Ok(tag)) => {
-                    let better = announced.as_ref()
-                        .map(|a| compare_versions(&tag, a) == Ordering::Greater)
-                        .unwrap_or(true);
-                    if is_version_like(&tag) && better {
-                        announced = Some(tag);
-                        announced_src = "Sophon(getBuild)";
-                        announce_err = None;
-                    }
-                }
-                Ok(Err(e)) => println!("[sophon] 取 tag 失败(回退公告推断): {}", e),
-                Err(_) => println!("[sophon] 取 tag 20s 超时(回退公告推断，不阻塞查版本)"),
+        // 🌟 分支 tag（getGameBranches）：国服/国际服都实测可用，是最硬的版本源。
+        //    （原来这里走的是 CN 专属的 Sophon getBuild，国际服根本用不了）
+        if let Some(tag) = branches_tag(base, &launcher_id, &biz) {
+            let better = announced.as_ref()
+                .map(|a| compare_versions(&tag, a) == Ordering::Greater)
+                .unwrap_or(true);
+            if is_version_like(&tag) && better {
+                announced = Some(tag);
+                announced_src = "分支tag(getGameBranches)";
+                announce_err = None;
             }
         }
 
@@ -1715,9 +1718,20 @@ impl GamePlatform for MihoyoPlatform {
     }
 
     fn download(&self, app: &tauri::AppHandle, game_id: &str, dest: &str, use_patch: bool, allow_old: bool, cancel: Arc<AtomicBool>) -> Result<String, String> {
-        // 🌟 原神/星铁 先路由到 Sophon 引擎：
+        let def = mihoyo_def(game_id).ok_or("未知的米哈游游戏")?;
+        // 国际服原神/星铁：官方已转分块分发，而国际服的构建入口（getBuild）还没接上 ——
+        // 与其去 CN 主机上撞 404，不如直接说清楚，让用户走官启。
+        if def.biz == "hk4e_global" || def.biz == "hkrpg_global" {
+            return Err(format!(
+                "国际服 {} 走分块分发，目前只接入了国服的分块引擎（国际服的构建入口没找到）。\n\
+                 → 请用『🩺 官方更新』拉起 HoYoPlay 更新；\n\
+                 → 国际服【绝区零】的整包是好的，可以直接下载。",
+                def.name));
+        }
+
+        // 🌟 国服原神/星铁 先路由到 Sophon 引擎：
         //    这条路不能依赖整包接口（整包源停更/下架时它仍要能走），所以 remote_info 挪到它后面。
-        if game_id == "genshin" || game_id == "starrail" {
+        if def.biz == "hk4e_cn" || def.biz == "hkrpg_cn" {
             let game_dir_str = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
             let game_dir = PathBuf::from(game_dir_str);
             
@@ -1725,9 +1739,9 @@ impl GamePlatform for MihoyoPlatform {
                 return Err(format!("{} 未绑定安装目录或目录不存在: {}", game_id, game_dir.display()));
             }
 
-            let biz = if game_id == "genshin" { "hk4e_cn" } else { "hkrpg_cn" };
+            let biz = def.biz;
             // launcher_id 独立解析（走候选验证），失败就退回配置里的第一个候选
-            let lid = match hyp_resolve(app) { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
+            let lid = match hyp_resolve(app, "cn") { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
             println!("[{}] Sophon 引擎启动, 作用目录: {}, launcher_id={}", game_id, game_dir.display(), lid);
 
             let client = crate::sophon::blocking_client();

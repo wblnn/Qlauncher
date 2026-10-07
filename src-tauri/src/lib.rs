@@ -315,11 +315,24 @@ fn get_running_games(app: tauri::AppHandle) -> HashMap<String, bool> {
 
 #[tauri::command(async)]
 fn check_remote(app: tauri::AppHandle, game_id: String) -> Result<crate::platform::RemoteGameInfo, String> {
-    platform_for_game(&game_id).ok_or("无平台支持")?.remote_info(&app, &game_id)
+    // ⚠️ 网络请求一律丢到独立系统线程：本命令是 (async)，函数体跑在 tokio worker 上，
+    //    在那里创建/析构 reqwest::blocking 客户端会 panic（Cannot drop a runtime…）
+    //    → 命令既不返回也不报错、前端「点了没反应」。顺带加硬超时，网络卡住不会挂死。
+    let platform = platform_for_game(&game_id).ok_or("无平台支持")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(platform.remote_info(&app, &game_id));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(90))
+        .map_err(|_| "查版本超时（90 秒）：网络太慢或接口不可达，稍后重试".to_string())?
 }
 
 #[tauri::command]
-fn start_download(app: tauri::AppHandle, game_id: String, dest: String, use_patch: bool, allow_old: bool) -> Result<String, String> {
+fn start_download(app: tauri::AppHandle, game_id: String, dest: String, use_patch: Option<bool>, allow_old: Option<bool>) -> Result<String, String> {
+    // 前端可能传 null（JS 的 && 链很容易把 null 原样送过来）—— 这里宽容成 false，
+    // 免得好端端的下载被 "invalid args: invalid type: null, expected a boolean" 拦住
+    let use_patch = use_patch.unwrap_or(false);
+    let allow_old = allow_old.unwrap_or(false);
     let platform = platform_for_game(&game_id).ok_or("无平台支持")?;
     let flag = cancel_flag(&game_id);
     flag.store(false, Ordering::SeqCst);
@@ -396,6 +409,16 @@ fn rollback_patch(app: tauri::AppHandle, game_id: String) -> Result<String, Stri
 /// 重活丢进独立线程并带超时 —— 同 hyp_get 的理由：命令是 (async)，函数体会跑在运行时线程上。
 #[tauri::command(async)]
 fn verify_game_files(app: tauri::AppHandle, game_id: String, deep: bool) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
+    // 库洛（鸣潮）：没有 pkg_version，走"官方清单对账"；同样丢线程 + 超时
+    if is_kuro(&game_id) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::platforms::kuro::kuro_verify(&app2, &game_id));
+        });
+        return rx.recv_timeout(std::time::Duration::from_secs(600))
+            .map_err(|_| "库洛清单对账超时（10 分钟）".to_string())?;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
     std::thread::spawn(move || {
@@ -405,9 +428,31 @@ fn verify_game_files(app: tauri::AppHandle, game_id: String, deep: bool) -> Resu
         .map_err(|_| "校验超时（30 分钟）".to_string())?
 }
 
+fn is_kuro(game_id: &str) -> bool {
+    platform_for_game(game_id).map(|p| p.id() == "kuro").unwrap_or(false)
+}
+
 /// 按校验结果只补缺失/损坏的文件（不等同整包重装）
 #[tauri::command(async)]
 fn repair_game_files(app: tauri::AppHandle, game_id: String) -> Result<String, String> {
+    // 库洛：清单差异集重下（引擎自带分块续传 + 官方 md5 校验），作用在已绑定目录。
+    // 鸣潮一次可能要下几十 GB，所以这里只"点火"不等待，进度/结果都走事件（同 start_download）。
+    if is_kuro(&game_id) {
+        let dir = crate::load_config(&app).get(&game_id).cloned().ok_or("游戏未绑定目录")?;
+        let cancel = cancel_flag(&game_id);
+        cancel.store(false, Ordering::SeqCst);
+        let app2 = app.clone();
+        let gid = game_id.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::platforms::kuro::kuro_download(&app2, &gid, &dir, cancel) {
+                let _ = app2.emit("download-progress", DownloadProgress {
+                    game_id: gid, downloaded: 0, total: 0, speed: 0, eta_seconds: None,
+                    status: format!("error:{}", e),
+                });
+            }
+        });
+        return Ok("库洛清单修复已启动：差异文件会逐个下载并用官方 md5 校验（进度看进度条，可随时 ✖ 取消）".into());
+    }
     crate::platforms::mihoyo::repair_files(&app, &game_id)
 }
 
