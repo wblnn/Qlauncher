@@ -1,6 +1,6 @@
 # qlauncher
 
-A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 + TypeScript**. It unifies multiple distribution platforms (miHoYo, Steam, Riot) behind a single interface: it auto-scans your machine for installed games, checks remote versions, supports full & differential downloads with speed and memory-usage controls, and launches games with one click.
+A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 + TypeScript**. It unifies multiple distribution platforms (miHoYo, Steam, Riot) behind a single interface: it auto-scans your machine for installed games, checks remote versions, supports full & differential (patch) downloads with low-resource streaming and speed limits, and launches games with one click.
 
 > The backend currently relies heavily on the Windows registry (`winreg`); it is primarily developed and verified on **Windows**.
 
@@ -12,15 +12,16 @@ A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 +
   - `Aggregate` (entry point only, e.g. Riot)
   - `DirectLaunch` (can be launched directly, e.g. Steam)
   - `Download` / `Full` (version check + download + launch, e.g. miHoYo)
-- **Installed-game scanning**: reads the Windows uninstall registry keys plus per-platform directory rules to detect install paths, executables and local version numbers
-- **Manual binding**: when the registry scan comes up empty, bind a game directory manually via a folder-picker dialog
+- **Installed-game scanning**: reads the Windows uninstall registry keys plus per-platform directory rules to detect install paths, executables and local version numbers; cloud-gaming entries are filtered out automatically
+- **Manual binding**: when the registry scan comes up empty, bind a game directory manually via a folder-picker dialog (exe candidate names are declared by each platform)
+- **Official-launcher detection**: locates the locally installed official launcher (HoYoPlay / Steam / Riot Client) from the registry and launches it with one click; falls back to the official website when not found, and a "web-only" mode is also available
 - **Version guard (P0)**: semantic version comparison — downloads are only allowed when the state is `fresh` (not installed) or `ahead` (remote has an update); if the API's package lags behind the local version it is marked `behind` and downloading is blocked, preventing "updates that make your game older"
 - **Full / differential downloads**: patches are preferred (with patch size shown; refused when the local version doesn't match `patch_from`), falling back to full packages; both support multi-part packages (`parts`); patch `.7z` archives are auto-extracted into `extracted/`
-- **Download UX**: real-time progress events (downloaded / total / instantaneous speed / ETA, emitted ~every 500 ms), cancel with partial-file cleanup, configurable streaming buffer (`download_buffer_mb`, larger = lower CPU usage), smooth CPU-yielding speed limit (`download_speed_limit_mbps`) and a disk-usage safety line (`download_limit_mb`)
+- **Low-resource streaming downloads**: configurable streaming buffer (`download_buffer_mb`, larger = lower CPU usage), smooth CPU-yielding speed limit (`download_speed_limit_mbps`) and a disk-usage safety line (`download_limit_mb`)
 - **Resume-friendly**: parts already fully present on disk (matching size) are skipped when restarting a download
+- **Real-time progress**: progress events (downloaded / total / instantaneous speed / ETA) emitted ~every 500 ms; cancel anytime with partial-file cleanup
 - **Running-state detection**: polls processes via `sysinfo`, distinguishing "running / installed / not installed" in the UI
-- **Official entry points**: open the official website or invoke the official launcher (`launcher_uri`) with one click
-- **API self-diagnosis**: built-in 🔬 self-check command printing HYP API connectivity, `launcher_id` source and package-parsing results to help debug broken APIs
+- **API self-diagnosis**: built-in 🔬 self-check command printing HYP API connectivity, `launcher_id` source, safety-line settings and package-parsing results to help debug broken APIs
 
 ## Tech Stack
 
@@ -36,7 +37,7 @@ A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 +
 - Node.js 18+ (20+ recommended) and npm
 - Rust toolchain (stable) + Tauri 2 prerequisites, see the [official guide](https://tauri.app/start/prerequisites/)
 - Windows: WebView2 Runtime and MSVC build tools
-- Recommended IDE: VS Code + Volar (Vue - Official), tauri-vscode, rust-analyzer (this repo ships with `.vscode` config)
+- Recommended IDE: VS Code + Volar (Vue - Official), tauri-vscode, rust-analyzer
 
 ## Quick Start
 
@@ -67,13 +68,14 @@ Vite uses a fixed port `1420` (`strictPort`) and ignores file watching under `sr
 ├── vite.config.ts            # Vite + Tauri dev config (port 1420 / HMR)
 ├── src/                      # Vue frontend
 │   ├── main.ts               # App bootstrap
-│   └── App.vue               # Main UI: game list, version comparison, download progress, buttons
+│   └── App.vue               # Main UI: game list, version comparison, download progress, official-site buttons
 ├── src-tauri/                # Rust backend
 │   ├── tauri.conf.json       # Tauri config (window, bundle, commands)
 │   ├── channels.json         # Runtime config: launcher_id, download buffer / speed limit / usage cap
 │   ├── capabilities/default.json  # Permission declarations (core / opener / dialog)
 │   └── src/
-│       ├── lib.rs            # Tauri command registration, registry scanning, launching & process detection
+│       ├── main.rs           # Binary entry point
+│       ├── lib.rs            # Tauri command registration, registry scanning, official-launcher detection, process checks
 │       ├── platform.rs       # Platform abstraction trait & data structures (GameInfo / RemoteGameInfo / DownloadProgress)
 │       └── platforms/
 │           ├── mod.rs        # Platform registry & game_id → platform routing
@@ -108,7 +110,7 @@ An invalid `launcher_id` causes miHoYo API calls to return `retcode != 0`. In th
    - Every read loop checks the cancel flag and the `download_limit_mb` safety line; exceeding it truncates the download and emits `done_test`
    - When a speed limit is active, the expected duration per chunk is computed and any surplus time is spent sleeping, so the CPU yields instead of busy-waiting
 5. Each part is MD5-verified as soon as it finishes writing; on failure the part is deleted and an error is raised to avoid dirty files
-6. Differential packages (`.7z`) are automatically extracted into `patch_<from>_<to>/extracted/` after download, with the inner structure printed, ready for later merging
+6. Differential packages are saved under `patch_<from>_<to>/`; `.7z` archives are automatically extracted into its `extracted/` folder afterwards, with the inner structure printed, ready for later merging
 7. Throughout the process, `download-progress` events report progress, instantaneous speed and ETA roughly every 500 ms; cancelling deletes the partial file and emits `error:已取消`
 
 ## Supported Games & IDs
@@ -130,10 +132,11 @@ To add a game, simply register its ID in the corresponding platform's `game_ids(
 | Command | Purpose |
 | --- | --- |
 | `get_installed_games` | Returns all games detected across platforms with install status |
-| `bind_game(id, dir)` | Manually bind a game directory |
-| `launch_game(id, use_official)` | Launch a game (or invoke the official launcher) |
-| `get_running_games` | Returns whether each game is currently running |
-| `official_info(game_id)` / `open_official(game_id, mode)` | Official-site info / open the official site |
+| `bind_game(id, dir)` | Manually bind a game directory (exe candidates declared by the platform) |
+| `launch_game(id, use_official)` | Launch a game (or invoke the official launcher protocol) |
+| `get_running_games` | Returns whether each game is currently running (`sysinfo` polling) |
+| `official_info(game_id)` | Returns the local official-launcher exe path, website URL and fallback address |
+| `open_official(game_id, mode)` | `auto`: launch local official launcher (fallback to web) / `web`: open the official site only |
 | `check_remote(game_id)` | Query the latest remote version, package size, patch availability & version relation |
 | `start_download(game_id, dest, use_patch)` | Start a download (full or differential; already-complete parts are skipped) |
 | `cancel_download(game_id)` | Cancel an in-progress download (partial files are cleaned up) |
@@ -143,8 +146,9 @@ The frontend listens via `listen("download-progress", ...)` to receive `Download
 
 ## Known Limitations
 
-- Registry scanning and parts of the launch logic are Windows-only; macOS / Linux require additional platform branches in `platform.rs`
+- Registry scanning and parts of the launch logic are Windows-only; macOS / Linux require additional platform branches
 - miHoYo downloads rely on the non-public HYP API; API changes must be mirrored in `mihoyo.rs`
-- There is no one-click post-download install / verification flow yet (extraction and MD5 verification are handled ad hoc inside platform implementations)
+- Differential downloads currently only fetch and extract the patch for inspection; there is no automatic merge / install-in-place flow yet
+- Speed-limit and buffer configuration changes take effect after restarting the app
 
 
