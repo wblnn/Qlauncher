@@ -411,21 +411,36 @@ fn rollback_patch(app: tauri::AppHandle, game_id: String) -> Result<String, Stri
 fn verify_game_files(app: tauri::AppHandle, game_id: String, deep: bool) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
     // 库洛（鸣潮）：没有 pkg_version，走"官方清单对账"；同样丢线程 + 超时
     if is_kuro(&game_id) {
+        let gid = game_id.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let app2 = app.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::platforms::kuro::kuro_verify(&app2, &game_id));
+            let _ = tx.send(crate::platforms::kuro::kuro_verify(&app2, &gid, deep));
         });
-        return rx.recv_timeout(std::time::Duration::from_secs(600))
-            .map_err(|_| "库洛清单对账超时（10 分钟）".to_string())?;
+        // 内容级对账要把安装目录读一遍（80GB 大约几分钟），给足时间
+        return match rx.recv_timeout(std::time::Duration::from_secs(3600)) {
+            Ok(v) => v,
+            Err(_) => {
+                // 超时不能只回 Err：后台线程还在读整盘，必须置取消位让它自己停下
+                cancel_flag(&game_id).store(true, Ordering::SeqCst);
+                Err("库洛对账超时（60 分钟）：已请求中止后台对账（已核对的部分不受影响）".to_string())
+            }
+        };
     }
+    let gid = game_id.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(crate::platforms::mihoyo::verify_files(&app2, &game_id, deep));
+        let _ = tx.send(crate::platforms::mihoyo::verify_files(&app2, &gid, deep));
     });
-    rx.recv_timeout(std::time::Duration::from_secs(1800))
-        .map_err(|_| "校验超时（30 分钟）".to_string())?
+    match rx.recv_timeout(std::time::Duration::from_secs(1800)) {
+        Ok(v) => v,
+        Err(_) => {
+            // 同理：让后台的逐文件校验看到取消位后自己收尾
+            cancel_flag(&game_id).store(true, Ordering::SeqCst);
+            Err("校验超时（30 分钟）：已请求中止后台校验（未改动任何文件）".to_string())
+        }
+    }
 }
 
 fn is_kuro(game_id: &str) -> bool {

@@ -145,7 +145,10 @@ function relationTip(game) {
     return `｜🚀 官宣 v${r.announced_version}，已启用 Sophon 增量引擎` + at
   }
   
-  if (r.version_relation === 'equal') return '｜✅ 已是最新' + at
+  if (r.version_relation === 'equal') {
+    // 查版本是"只比大小"的快判（不能为它去读 80GB），库洛这边如实说明
+    return (game?.platform === 'kuro' ? '｜✅ 大小一致（要确认内容请点 🩹 校验修复 → 内容级）' : '｜✅ 已是最新') + at
+  }
   if (r.version_relation === 'behind') return `｜⚠️ 接口整包滞后(本地 v${r.local_version} 更新)，禁下载` + at
   if (r.version_relation === 'announced') return `｜⚠️ 官宣 v${r.announced_version}（推断），接口整包只到 v${r.latest_version} → 请用『🩺 官方更新』` + at
   return at
@@ -409,9 +412,11 @@ async function verifyRepair(gameId) {
   const game = games.value.find(g => g.id === gameId)
   const isKuro = game?.platform === 'kuro'
   const isSophon = (gameId === 'genshin' || gameId === 'starrail')
-  // Sophon / 库洛：校验都是"拉官方清单对账"，没有快/深之分
-  const deep = (isSophon || isKuro) ? true
-    : !confirm('校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
+  // Sophon 固定内容级；库洛可选快/内容级；米哈游可选快/深度
+  const deep = isSophon ? true
+    : !confirm(isKuro
+      ? '校验方式：\n\n【确定】快速校验 —— 只比文件大小 + 关键 exe 的 md5，秒级\n【取消】内容级校验 —— 逐块核对官方 100MiB 分块 md5（80GB 要几分钟），能抓出"大小没变但内容被改"的文件\n\n（选哪个都会先给你一份报告，不会直接动手）'
+      : '校验方式：\n\n【确定】快速校验 —— 只比文件大小，几秒出结果\n【取消】深度校验 —— 逐文件算 md5，慢（几十 GB 要几分钟）但更准\n\n（选哪个都会先给你一份报告，不会直接动手）')
   patchBusy.value = gameId
   patchBusyStart.value = Date.now()
   patchProgress.value[gameId] = isSophon ? 'Sophon 对账：拉官方分块清单…'

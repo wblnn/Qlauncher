@@ -348,13 +348,114 @@ const KEY_FILES: &[&str] = &[
     "Client/Binaries/Win64/Client-Win64-Shipping.exe",
 ];
 
-/// 差异集：size 不对/缺失 = 需要下载（首次安装时 = 全部）
+/// 差异集（**只比 size**）：首次安装/快速校验用。
+/// ⚠️ 同尺寸但内容变了的文件会被它判成"一致" —— 所以下载/修复一律走 `diff_entries_deep`（内容级）。
 fn diff_entries(root: &Path, manifest: &[KuroEntry]) -> Vec<KuroEntry> {
     manifest.iter()
         .filter(|e| !e.dest.is_empty() && !e.dest.ends_with('/') && e.size > 0)
         .filter(|e| local_size(root, &e.dest) != Some(e.size))
         .cloned()
         .collect()
+}
+
+// ================= 内容级对账（同尺寸不同内容也要发现）=================
+/// 官方清单给大文件带了 100MiB 分块的逐块 md5（chunkInfos），这里就用它做**内容级**核对：
+/// ① 能发现"同尺寸不同内容"（原地改配置、同尺寸 pak 重打包都能抓）；
+/// ② 能只重下真正坏掉的那几块，而不是整个 18GB 的 pak（真正的分块级增量）。
+struct FileDiff {
+    entry: KuroEntry,
+    /// 本地根本没有
+    missing: bool,
+    /// 本地长度 != 官方 size（需要截断/补长）
+    size_mismatch: bool,
+    /// 内容不符的分块（本地存在时的精确坏块表）
+    bad_chunks: Vec<KuroChunk>,
+    /// 实际需要下载的**压缩**字节（进度条、空间预检、报告都用它）
+    need_bytes: u64,
+}
+
+/// 内容级核对单个文件。Ok(None) = 完全一致（跳过）；cancel → Err("已取消…")
+fn verify_local_file(root: &Path, e: &KuroEntry, cancel: &AtomicBool) -> Result<Option<FileDiff>, String> {
+    let p = root.join(e.dest.replace('/', "\\"));
+    let meta = match std::fs::metadata(&p) {
+        Ok(m) => m,
+        Err(_) => {
+            // 文件是裸传（官方 size 就是落盘/下载字节数），整文件缺失 = 下 e.size
+            return Ok(Some(FileDiff { entry: e.clone(), missing: true, size_mismatch: true, bad_chunks: Vec::new(), need_bytes: e.size }));
+        }
+    };
+    let local_len = meta.len();
+    let size_mismatch = local_len != e.size;
+
+    // 小文件（官方没给分块信息）：整文件 md5
+    if e.chunk_infos.is_empty() {
+        if !size_mismatch && (e.md5.is_empty() || file_md5(&p).map(|h| h.eq_ignore_ascii_case(&e.md5)).unwrap_or(false)) {
+            return Ok(None);
+        }
+        return Ok(Some(FileDiff { entry: e.clone(), missing: false, size_mismatch, bad_chunks: Vec::new(), need_bytes: e.size }));
+    }
+
+    // 大文件：逐块核对官方 md5（短读/文件比块短都算这一块坏）
+    // ⚠️ 打不开的文件（被游戏占用/权限）不能让它把整盘对账带崩：按"内容不符"处理，
+    //    交给下载阶段去逐文件报错（那里有清晰的 per-file 错误信息）。
+    let mut f = match std::fs::File::open(&p) {
+        Ok(f) => f,
+        Err(x) => {
+            println!("[kuro] 打不开 {}（按内容不符处理）: {}", e.dest, x);
+            let need: u64 = e.chunk_infos.iter().map(|c| c.end.saturating_sub(c.start) + 1).sum();
+            return Ok(Some(FileDiff {
+                entry: e.clone(), missing: false, size_mismatch,
+                bad_chunks: e.chunk_infos.clone(), need_bytes: need }));
+        }
+    };
+    let mut bad: Vec<KuroChunk> = Vec::new();
+    let mut need_bytes = 0u64;
+    for c in &e.chunk_infos {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err("已取消（对账中断，未改动任何文件）".into());
+        }
+        let len = c.end.saturating_sub(c.start) + 1;
+        let mut ok = local_len >= c.end + 1;
+        if ok && len > 0 {
+            let mut buf = vec![0u8; len as usize];
+            ok = match (f.seek(SeekFrom::Start(c.start)), f.read_exact(&mut buf)) {
+                (Ok(_), Ok(_)) => c.md5.is_empty() || format!("{:x}", md5::compute(&buf)).eq_ignore_ascii_case(&c.md5),
+                _ => false,
+            };
+        }
+        if !ok {
+            // chunkInfos 里没有压缩大小（只有 start/end/md5）：文件是裸传，块的下载量 ≈ 块长度
+            need_bytes += len;
+            bad.push(c.clone());
+        }
+    }
+    if bad.is_empty() && !size_mismatch { return Ok(None); }
+    // 所有块都对、只是长度不对 → 不用下载，截断即可（need_bytes 归零）
+    if bad.is_empty() { need_bytes = 0; }
+    Ok(Some(FileDiff { entry: e.clone(), missing: false, size_mismatch, bad_chunks: bad, need_bytes }))
+}
+
+/// 内容级差异集（下载 / 修复 / 深度校验都走这里）。回调报进度：(已核对文件数, 总数)
+fn diff_entries_deep<F: FnMut(usize, usize)>(
+    root: &Path,
+    manifest: &[KuroEntry],
+    cancel: &AtomicBool,
+    mut on_progress: F,
+) -> Result<Vec<FileDiff>, String> {
+    let cand: Vec<&KuroEntry> = manifest.iter()
+        .filter(|e| !e.dest.is_empty() && !e.dest.ends_with('/') && e.size > 0)
+        .collect();
+    let total = cand.len();
+    let mut out = Vec::new();
+    for (i, e) in cand.iter().enumerate() {
+        if i % 20 == 0 { on_progress(i, total); }
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err("已取消（对账中断，未改动任何文件）".into());
+        }
+        if let Some(d) = verify_local_file(root, e, cancel)? { out.push(d); }
+    }
+    on_progress(total, total);
+    Ok(out)
 }
 
 // ================= 下载引擎 =================
@@ -428,14 +529,19 @@ fn stop_reporter(sh: &Arc<ProgShared>, reporter: std::thread::JoinHandle<()>) {
 }
 
 /// 下载并校验单个文件（分块续传 → 整文件 md5 → 落位）
+/// 下载/修复单个文件：
+///   ① 本地缺 → 空底稿，从零分块下（仍是断点续传）
+///   ② 本地有但内容不符 → **先复制本地当底稿，只补坏块**（分块级增量，不用重下整个 18GB pak）
+///   ③ 上次中断留下的 .qkuro → 直接当续跑底稿，逐块校验跳过已好的
 fn download_entry(
     cdn: &str,
     cfg: &KuroConfig,
-    e: &KuroEntry,
+    diff: &FileDiff,
     root: &Path,
     sh: &Arc<ProgShared>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let e = &diff.entry;
     sh.set_current(&e.dest);
     let target = root.join(e.dest.replace('/', "\\"));
     if let Some(par) = target.parent() { std::fs::create_dir_all(par).map_err(|x| x.to_string())?; }
@@ -449,21 +555,42 @@ fn download_entry(
         e.chunk_infos.clone()
     };
 
+    // 底稿选择
+    let resume = tmp.exists();
+    let mut only: Option<Vec<KuroChunk>> = None;
+    if !resume && !diff.missing {
+        std::fs::copy(&target, &tmp).map_err(|x| format!("复制本地文件做底稿失败 {}: {}", e.dest, x))?;
+        // ⚠️ 只有"精确坏块表非空"时才启用跳过：小文件走整文件 md5 分支、bad_chunks 恒为空，
+        //    那时若也设成 Some(空表)，下面会把所有块都 continue 掉（一个字节不下）→ 必然校验失败。
+        if !diff.bad_chunks.is_empty() {
+            only = Some(diff.bad_chunks.clone());
+        }
+    } else if !resume {
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     let mut f = std::fs::OpenOptions::new().create(true).read(true).write(true)
         .open(&tmp).map_err(|x| format!("开临时文件失败 {}: {}", tmp.display(), x))?;
-    let have = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut have = have;
+    // 长度对齐（只有"块全对、单纯长度不符"的情况才会走到这）
+    if diff.size_mismatch && !diff.missing {
+        f.set_len(e.size).map_err(|x| format!("{} 调整长度失败: {}", e.dest, x))?;
+    }
+    let mut have = f.metadata().map(|m| m.len()).unwrap_or(0);
     let client = chunk_client();
 
     for c in &chunks {
         if cancel.load(AtomicOrdering::Relaxed) {
             return Err("已取消（已下好的分块保留在 .qkuro 里，重跑会接着下）".into());
         }
+        // "只补坏块"模式：其它块在底稿里是可信的，直接跳过
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x.start == c.start && x.end == c.end) { continue; }
+        }
         let len = c.end.saturating_sub(c.start) + 1;
         if len == 0 { continue; }
 
-        // ① 已下好？读回来校验分块 md5
-        if have >= c.end + 1 {
+        // ① 已下好？读回来校验分块 md5（续跑模式才需要；底稿复制模式下坏块必然要重下）
+        if only.is_none() && have >= c.end + 1 {
             let mut buf = vec![0u8; len as usize];
             let ok = match (f.seek(SeekFrom::Start(c.start)), f.read_exact(&mut buf)) {
                 (Ok(_), Ok(_)) => c.md5.is_empty() || format!("{:x}", md5::compute(&buf)).eq_ignore_ascii_case(&c.md5),
@@ -571,29 +698,48 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
     std::fs::create_dir_all(&root).map_err(|e| format!("创建目录失败: {}", e))?;
     println!("[kuro] 安装根目录: {}", root.display());
 
-    let mut queue = diff_entries(&root, &manifest);
-    let need: u64 = queue.iter().map(|e| e.size).sum();
-    println!("[kuro] 差异集: {} / {} 个文件，需下 {} ", queue.len(), manifest.len(), crate::fmt_size(need));
+    // 内容级对账：不只看 size —— 同尺寸但内容变了的（原地改配置、同尺寸 pak 重打包）也要抓出来。
+    // 首次安装本地没文件，这一步几乎是瞬间的。
+    println!("[kuro] 内容级对账中（官方分块 md5，{} 个文件）…", manifest.len());
+    let queue: Vec<FileDiff> = {
+        let a = app.clone();
+        let gid = game_id.to_string();
+        let mut last = Instant::now();
+        diff_entries_deep(&root, &manifest, &cancel, |i, t| {
+            if last.elapsed().as_millis() >= 300 || i == t {
+                let _ = a.emit("download-progress", DownloadProgress {
+                    game_id: gid.clone(), downloaded: i as u64, total: t as u64,
+                    speed: 0, eta_seconds: None, status: "verifying".into() });
+                last = Instant::now();
+            }
+        })?
+    };
+    let need: u64 = queue.iter().map(|d| d.need_bytes).sum();
+    let n_missing = queue.iter().filter(|d| d.missing).count();
+    println!("[kuro] 对账结果：需处理 {} / {} 个文件（缺失 {} ｜ 内容或长度不符 {}）｜ 实际需下载 {}",
+        queue.len(), manifest.len(), n_missing, queue.len() - n_missing, crate::fmt_size(need));
 
     if queue.is_empty() {
         write_local_version(&root, &cfg.version);
         let _ = app.emit("download-progress", DownloadProgress {
             game_id: game_id.into(), downloaded: 0, total: 0, speed: 0, eta_seconds: Some(0),
             status: format!("done:{}", root.display()) });
-        return Ok(format!("本地已与远程 v{} 一致，无需下载", cfg.version));
+        return Ok(format!("本地已与官方 v{} 逐块一致，无需下载", cfg.version));
     }
 
-    // 空间预检：文件是裸传，落盘 ≈ 下载量；再留 5GB 余量给运行/日志
+    // 空间预检：下载量 + 需要复制底稿的最大文件（分块修复要先复制一份）+ 5GB 余量
+    let copy_need: u64 = queue.iter().filter(|d| !d.missing).map(|d| d.entry.size).max().unwrap_or(0);
     if let Some(free) = crate::platforms::mihoyo::free_space_of(&root) {
-        if free < need + 5 * 1024 * 1024 * 1024 {
+        if free < need + copy_need + 5 * 1024 * 1024 * 1024 {
             return Err(format!(
-                "目标盘空间不足：需要约 {}（{} 个文件）+ 5GB 余量，当前可用 {}。\n→ 换个盘，或先清理空间。",
-                crate::fmt_size(need), queue.len(), crate::fmt_size(free)));
+                "目标盘空间不足：需要约 {}（下载 {} + 复制底稿最多 {}）+ 5GB 余量，当前可用 {}。\n→ 换个盘，或先清理空间。",
+                crate::fmt_size(need + copy_need), crate::fmt_size(need), crate::fmt_size(copy_need), crate::fmt_size(free)));
         }
     }
 
     // 小文件先下（早一点有"装上了"的实感），大 pak 在后面
-    queue.sort_by_key(|e| e.size);
+    let mut queue = queue;
+    queue.sort_by_key(|d| d.entry.size);
 
     // 进度：共享计数 + 独立上报线程（固定 1 秒一拍，与下载循环解耦）
     let sh = ProgShared::new(need);
@@ -602,7 +748,7 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
     let total_files = queue.len();
     let mut done_files = 0usize;
     let mut failed: Vec<String> = Vec::new();
-    for e in &queue {
+    for d in &queue {
         if cancel.load(AtomicOrdering::Relaxed) {
             if let Some(r) = reporter.take() { stop_reporter(&sh, r); }
             return Err(format!("已取消（已完成 {} / {} 个文件，重跑会接着下）", done_files, total_files));
@@ -611,7 +757,7 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
         let mut ok = false;
         // 每个文件最多换 2 个 CDN 重试
         for attempt in 0..2usize {
-            match download_entry(&cdn, &cfg, e, &root, &sh, &cancel) {
+            match download_entry(&cdn, &cfg, d, &root, &sh, &cancel) {
                 Ok(_) => { ok = true; break; }
                 Err(err) => {
                     last_err = err.clone();
@@ -619,7 +765,7 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
                         if let Some(r) = reporter.take() { stop_reporter(&sh, r); }
                         return Err(err);
                     }
-                    println!("[kuro] {} 第 {} 次失败: {}", e.dest, attempt + 1, err);
+                    println!("[kuro] {} 第 {} 次失败: {}", d.entry.dest, attempt + 1, err);
                     if attempt == 0 && cdns.len() > 1 {
                         cdn = cdns[(cdns.iter().position(|c| c == &cdn).unwrap_or(0) + 1) % cdns.len()].clone();
                         println!("[kuro] 换 CDN 重试: {}", cdn);
@@ -630,7 +776,7 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
             }
         }
         if !ok {
-            failed.push(format!("{} → {}", e.dest, last_err));
+            failed.push(format!("{} → {}", d.entry.dest, last_err));
             // 连续失败就别硬撑了，把已完成的保住，报清楚
             if failed.len() >= 5 {
                 if let Some(r) = reporter.take() { stop_reporter(&sh, r); }
@@ -641,7 +787,7 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
             continue;
         }
         done_files += 1;
-        sh.set_current(&e.dest);
+        sh.set_current(&d.entry.dest);
     }
 
     if !failed.is_empty() {
@@ -659,47 +805,80 @@ fn kuro_download_inner(app: &tauri::AppHandle, game_id: &str, dest: &str, cancel
     Ok(format!("{} 完成：v{}，本次下载 {} 个文件 / {}", g.name, cfg.version, done_files, crate::fmt_size(need)))
 }
 
-/// 校验（对账口径）：官方清单 vs 本地（size 快扫 + 关键文件 md5）
-pub fn kuro_verify(app: &tauri::AppHandle, game_id: &str) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
+/// 校验：fast = 只比 size（秒级，但漏"同尺寸不同内容"）；deep = 内容级（官方 100MiB 分块 md5）
+pub fn kuro_verify(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
     let a = app.clone();
     let g = game_id.to_string();
-    on_worker(move || kuro_verify_inner(&a, &g))
+    on_worker(move || kuro_verify_inner(&a, &g, deep))
 }
 
-fn kuro_verify_inner(app: &tauri::AppHandle, game_id: &str) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
+fn kuro_verify_inner(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
     let g = game_def(game_id).ok_or("未知的库洛游戏")?;
-    let root = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
-    let root = PathBuf::from(root);
+    let root = PathBuf::from(crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?);
     let (cfg, cdns, _) = fetch_config(app, g)?;
     let manifest = fetch_manifest(&cfg, &cdns[0])?;
-    let changed = diff_entries(&root, &manifest);
-    let total: usize = manifest.len();
-    let ok = total - changed.len();
-    let changed_bytes: u64 = changed.iter().map(|e| e.size).sum();
-    // 关键文件 md5：判断"本地是不是就是远程这个版本"
-    let mut key_bad = 0usize;
-    let mut key_note = Vec::new();
-    for k in KEY_FILES {
-        if let Some(e) = manifest.iter().find(|e| e.dest == *k) {
-            let lp = root.join(k.replace('/', "\\"));
-            match file_md5(&lp) {
-                Ok(h) if h.eq_ignore_ascii_case(&e.md5) => {}
-                Ok(h) => { key_bad += 1; key_note.push(format!("[md5 不符] {} 期望{} 实际{}", k, e.md5, h)); }
-                Err(_) => { key_bad += 1; key_note.push(format!("[缺失] {}", k)); }
+    let cancel = crate::cancel_flag(game_id);
+    cancel.store(false, AtomicOrdering::SeqCst);
+    let total = manifest.iter()
+        .filter(|e| !e.dest.is_empty() && !e.dest.ends_with('/') && e.size > 0).count();
+
+    let (missing, size_bad, md5_bad, broken_bytes, sample) = if deep {
+        // 内容级：逐块（大文件）或整文件（小文件）核对官方 md5 —— 同尺寸不同内容也能抓出来
+        let started = Instant::now();
+        let diffs = diff_entries_deep(&root, &manifest, &cancel, |i, t| {
+            if i % 20 == 0 || i == t {
+                let el = started.elapsed().as_secs_f64();
+                let speed = if el > 0.0 { (i as f64 / el) as u64 } else { 0 };
+                let _ = app.emit("download-progress", DownloadProgress {
+                    game_id: game_id.into(), downloaded: i as u64, total: t as u64, speed,
+                    eta_seconds: if speed > 0 { Some((t.saturating_sub(i) as u64) / speed) } else { None },
+                    status: "verifying".into() });
+                let _ = app.emit("verify-progress", crate::platforms::mihoyo::PatchProgress {
+                    game_id: game_id.into(), done: i as u64, total: t as u64,
+                    current: format!("内容级对账 {}/{}", i, t), status: "patching".into() });
+            }
+        })?;
+        let missing = diffs.iter().filter(|d| d.missing).count();
+        let size_bad = diffs.iter().filter(|d| !d.missing && d.size_mismatch).count();
+        let md5_bad = diffs.iter().filter(|d| !d.missing && !d.size_mismatch).count();
+        let bytes: u64 = diffs.iter().map(|d| d.need_bytes).sum();
+        let sample: Vec<String> = diffs.iter().take(30).map(|d| {
+            let why = if d.missing { "缺失".to_string() }
+                else if d.size_mismatch { "大小不符".to_string() }
+                else { format!("内容不符（同尺寸！坏 {} 块）", d.bad_chunks.len()) };
+            format!("[{}] {} ({})", why, d.entry.dest, crate::fmt_size(d.entry.size))
+        }).collect();
+        (missing, size_bad, md5_bad, bytes, sample)
+    } else {
+        // 快速：只比 size（老口径）+ 两个关键 exe 的 md5（便宜，能挡"版本对但被改"）
+        let changed = diff_entries(&root, &manifest);
+        let missing = changed.iter().filter(|e| local_size(&root, &e.dest).is_none()).count();
+        let size_bad = changed.len() - missing;
+        let mut key_bad = 0usize;
+        for k in KEY_FILES {
+            if let Some(e) = manifest.iter().find(|e| e.dest == *k) {
+                let p = root.join(k.replace('/', "\\"));
+                if file_md5(&p).map(|h| !h.eq_ignore_ascii_case(&e.md5)).unwrap_or(true) { key_bad += 1; }
             }
         }
-    }
+        let bytes: u64 = changed.iter().map(|e| e.size).sum();
+        let sample: Vec<String> = changed.iter().take(30)
+            .map(|e| format!("[缺失/大小不符] {} ({})", e.dest, crate::fmt_size(e.size))).collect();
+        (missing, size_bad, key_bad, bytes, sample)
+    };
+
     let local_version = local_version_of(&root).unwrap_or_default();
-    let version_match = key_bad == 0 && (local_version.is_empty() || local_version == cfg.version);
-    let mut sample: Vec<String> = changed.iter().take(30)
-        .map(|e| format!("[需下载] {} ({})", e.dest, crate::fmt_size(e.size))).collect();
-    sample.extend(key_note.iter().cloned());
-    if sample.is_empty() { sample.push("✅ 与官方清单完全一致".into()); }
+    let version_match = missing + size_bad + md5_bad == 0;
+    let mut sample = sample;
+    if sample.is_empty() { sample.push("✅ 与官方清单一致".into()); }
     Ok(crate::platforms::mihoyo::VerifyReport {
-        manifest: format!("库洛官方清单（{} / {}，共 {} 个文件，{}）", g.name, cfg.version, total, crate::fmt_size(cfg.size)),
-        total, ok, missing: changed.iter().filter(|e| local_size(&root, &e.dest).is_none()).count(),
-        size_bad: changed.iter().filter(|e| local_size(&root, &e.dest).is_some()).count(),
-        md5_bad: key_bad, deep: true, broken_bytes: changed_bytes, sample,
+        manifest: format!("库洛官方清单（{} / {}，{} 个文件，{}；口径：{}）",
+            g.name, cfg.version, total, crate::fmt_size(cfg.size),
+            if deep { "内容级（官方分块 md5）" } else { "快速（只比大小 + 关键 exe md5）" }),
+        total,
+        ok: total.saturating_sub(missing + size_bad + md5_bad),
+        missing, size_bad, md5_bad, deep,
+        broken_bytes, sample,
         res_list_url: None, local_version, remote_version: cfg.version.clone(),
         version_match, sophon_managed: false, sophon_tag: None,
     })
