@@ -212,7 +212,8 @@ pub fn diff_local<F: Fn(usize, usize)>(
         }
         if i % 100 == 0 { on_progress(i, total); }
         if f.is_folder { continue; }
-        let local = game_dir.join(&f.file);
+        // QL-01：f.file 来自远程 Protobuf 清单，必须先做穿越校验再用于读盘
+        let local = crate::path_safety::safe_join_under(game_dir, &f.file)?;
         let need = match std::fs::metadata(&local) {
             Err(_) => true,
             Ok(m) => {
@@ -310,7 +311,8 @@ where
             return Err("已取消（已替换的文件保留，staging 里已下好的分块会在下次续跑时复用）".into());
         }
         p.current_file = f.file.clone();
-        let staging_path = staging_dir.join(&f.file);
+        // QL-01：staging 目录同样需要边界校验，防止 create_dir_all / create 写到目录外
+        let staging_path = crate::path_safety::safe_join_under(staging_dir, &f.file)?;
         if let Some(par) = staging_path.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
 
         let mut file = std::fs::OpenOptions::new()
@@ -375,7 +377,8 @@ where
             return Err(format!("staging 整文件 md5 不符(续跑会重组该文件): {}", f.file));
         }
 
-        let target = game_dir.join(&f.file);
+        // QL-01：落位目标同样校验（rename 会覆盖游戏目录外的同名文件）
+        let target = crate::path_safety::safe_join_under(game_dir, &f.file)?;
         if let Some(par) = target.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
         if target.exists() {
             let mut old = target.clone();

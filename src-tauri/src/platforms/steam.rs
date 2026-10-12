@@ -32,7 +32,7 @@ impl GamePlatform for SteamPlatform {
             .map(|(_, _, appid)| *appid)
             .ok_or("未知 Steam 游戏")?;
         let uri = format!("steam://run/{}", appid);
-        std::process::Command::new("cmd").args(["/C", "start", &uri]).spawn().map_err(|e| e.to_string())?;
+        crate::open_external(&uri)?;
         Ok(format!("已唤起 Steam: {}", uri))
     }
 }

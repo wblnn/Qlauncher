@@ -27,6 +27,8 @@ tauri-plugin-dialog = "2"
 sysinfo = "0.31"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 md5 = "0.7"
+# QL-05：外置二进制（hpatchz.exe）与配置来源的完整性 / 信任边界校验
+sha2 = "0.10"
 sevenz-rust = "0.6"
 # 整包自动解压用（两者都已在依赖树里，离线可解析）：flate2 解 zip 的 deflate，crc32fast 校验 CRC
 flate2 = "1"

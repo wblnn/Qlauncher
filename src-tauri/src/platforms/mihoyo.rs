@@ -76,8 +76,10 @@ pub struct ChannelsFile {
     download_buffer_mb: Option<u64>,
     // 新增：下载限速(MB/s)，0 或不填为不限速。限速会自动让出 CPU
     download_speed_limit_mbps: Option<u64>,
-    // 新增：hpatchz.exe 路径，缺省 = 项目 src-tauri/hpatchz.exe
+    // hpatchz.exe 路径（QL-05：只能指向可信目录内的 hpatchz.exe，且要通过 SHA-256 校验）
     hpatchz_path: Option<String>,
+    // 仅开发期生效：覆盖 hpatchz.exe 的固定 SHA-256；发布版忽略此字段
+    hpatchz_sha256: Option<String>,
     /// 整包解压成功后是否删掉分卷（缺省 true = 保留；硬盘紧张时设 false 省空间）
     keep_volumes_after_extract: Option<bool>,
     /// launcher_id 候选列表（按优先级；每个都会被 getGames 验证后才采用）
@@ -89,10 +91,16 @@ pub struct ChannelsFile {
 
 }
 
-/// 配置三级来源：项目源码（开发期主配置，改文件即时生效）→ 用户目录（生产覆盖）→ 内置默认
+/// 配置来源：开发期以项目源码为主（改文件即时生效），生产只看用户目录。
+/// QL-05：发布版**不再**回退到构建机源码路径（env!("CARGO_MANIFEST_DIR") 会被打进二进制，
+/// 在开发机上恰好存在 → 优先级还高于用户目录）。用户目录内容仍按不可信处理：
+/// 可执行文件路径与 API 端点都必须再经过 trust 层校验。
 pub fn channels_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("channels.json");
-    if project.is_file() { return Some(project); }
+    #[cfg(debug_assertions)]
+    {
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("channels.json");
+        if project.is_file() { return Some(project); }
+    }
     if let Ok(dir) = app.path().app_data_dir() {
         let user = dir.join("channels.json");
         if user.is_file() { return Some(user); }
@@ -107,7 +115,7 @@ fn read_channels(app: &tauri::AppHandle) -> ChannelsFile {
             }
         }
     }
-    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None, hpatchz_path: None, keep_volumes_after_extract: None, launcher_ids: None, biz_patterns: None, sophon_categories: None }
+    ChannelsFile { launcher_id: None, download_limit_mb: None, download_buffer_mb: None, download_speed_limit_mbps: None, hpatchz_path: None, hpatchz_sha256: None, keep_volumes_after_extract: None, launcher_ids: None, biz_patterns: None, sophon_categories: None }
 }
 
 // ================= 版本源自适应：候选 launcher_id / 渠道匹配 / 公告推断 =================
@@ -276,25 +284,25 @@ fn download_limit_bytes(app: &tauri::AppHandle) -> u64 {
     read_channels(app).download_limit_mb.unwrap_or(0) * 1024 * 1024
 }
 
-// hpatchz.exe 位置：channels.json 覆盖 → exe 同级目录 → 项目目录(dev兜底)
+/// hpatchz.exe 位置（QL-05）：不再"配置给什么就执行什么"。
+/// 配置只能指向可信根内的 hpatchz.exe，且最终二进制必须通过 SHA-256 固定校验；
+/// 生产版不再回退到构建机源码目录（env!("CARGO_MANIFEST_DIR")）。
 fn hpatchz_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let cfg = read_channels(app);
-    if let Some(p) = cfg.hpatchz_path.filter(|v| !v.trim().is_empty()) {
-        return Ok(PathBuf::from(p));
-    }
-    
-    // 优先：打包版找 qlauncher.exe 同目录
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("hpatchz.exe");
-            if p.exists() {
-                return Ok(p);
-            }
-        }
-    }
-    
-    // 兜底：dev 模式找源码目录
-    Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join("hpatchz.exe"))
+    // 开发期允许用 channels.json 覆盖固定哈希，方便换 HDiffPatch 版本调试；
+    // 发布版只认编译进代码的固定值，配置文件改不动它。
+    let expected: String = if cfg!(debug_assertions) {
+        cfg.hpatchz_sha256.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            .unwrap_or(crate::trust::HPATCHZ_SHA256).to_string()
+    } else {
+        crate::trust::HPATCHZ_SHA256.to_string()
+    };
+    crate::trust::resolve_executable(
+        &crate::trust::trusted_exe_roots(app),
+        cfg.hpatchz_path.as_deref(),
+        "hpatchz.exe",
+        &expected,
+    )
 }
 
 /// 单文件 hdiff 合成：hpatchz <旧文件> <增量文件> <新文件>
@@ -573,8 +581,8 @@ fn manifest_entries(dir: &str) -> Result<Vec<ManifestEntry>, String> {
 fn verify_sophon(app: &tauri::AppHandle, game_id: &str, game_dir: &str) -> Result<VerifyReport, String> {
     let biz = mihoyo_def(game_id).map(|g| g.biz).ok_or("未知的米哈游游戏")?;
     // 取消支持：界面『✖ 取消』会置这个标志，对账过程每文件检查一次
+    // QL-04：令牌由 acquire_task 新建（初值 false），这里不再重置 —— 否则刚启动就点取消会被吞掉
     let cancel = crate::cancel_flag(game_id);
-    cancel.store(false, AtomicOrdering::SeqCst);
     let lid = match hyp_resolve(app, "cn") { Ok((l, _, _)) => l, Err(_) => hyp_launcher_id(app).0 };
     let client = crate::sophon::blocking_client();
     let category = read_channels(app).sophon_categories
@@ -631,8 +639,8 @@ pub fn verify_files(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Result
     }
     let entries = manifest_entries(&game_dir)?;
     // 取消支持：校验/深度扫描可能几分钟，界面『✖ 取消』必须能中断（以前这里完全没读标志位）
+    // QL-04：令牌由 acquire_task 新建（初值 false），这里不再重置
     let cancel = crate::cancel_flag(game_id);
-    cancel.store(false, AtomicOrdering::SeqCst);
     let (res_list_url, remote_version) = match crate::platforms::platform_for_game(game_id) {
         Some(p) => match p.remote_info(app, game_id) {
             Ok(i) => (Some(i.res_list_url.clone()).filter(|s| !s.is_empty()), i.latest_version),
@@ -710,7 +718,7 @@ fn url_encode_path(p: &str) -> String {
 /// 按缓存里的坏文件清单逐文件补全（md5 校验后才落位）。
 /// 进度走 download-progress{status:"repairing"}：字节 + 速度 + 剩余秒数 → 界面直接画进度条和倒计时。
 /// 支持中途取消（复用界面的『✖ 取消』按钮）、单个文件失败自动重试 3 次。
-pub fn repair_files(app: &tauri::AppHandle, game_id: &str) -> Result<String, String> {
+pub fn repair_files(app: &tauri::AppHandle, game_id: &str, guard: crate::TaskGuard) -> Result<String, String> {
     // 原神/星铁：逐文件补全用的是"旧版整包"的散列地址，会把已更新的文件降级搞乱
     if game_id == "genshin" || game_id == "starrail" {
         return Err("原神/星铁已改用 Sophon 分块体系：逐文件补全依赖旧整包的散列地址，会把新版本文件搞乱。\n→ 请直接点『⬇ 增量更新 (Sophon)』——它自带缺失/损坏文件的对账与补全（缺什么补什么）。".into());
@@ -736,9 +744,10 @@ pub fn repair_files(app: &tauri::AppHandle, game_id: &str) -> Result<String, Str
     let dir = game_dir.clone();
     let total = broken.len();
     let total_bytes: u64 = broken.iter().map(|(_, _, s)| *s).sum();
+    // QL-04：令牌由 acquire_task 新建（初值 false），这里不再重置 —— 否则刚启动就点取消会被吞掉
     let cancel = crate::cancel_flag(game_id);
-    cancel.store(false, AtomicOrdering::SeqCst);
     std::thread::spawn(move || {
+        let _guard = guard; // 线程结束才释放"修复"占用
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build() {
@@ -988,11 +997,13 @@ fn unzip_virtual<R: Read + Seek>(r: &mut R, total: u64, out_dir: &Path) -> Resul
         }
         p = eend + comment_len;
 
-        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
-            return Err(format!("压缩包里有可疑路径，已中止: {}", name));
-        }
+        // L-02：条目名直读中央目录，必须先走统一的穿越校验。
+        // 原来的检查只挡 ".." 与开头的分隔符，挡不住 C:\evil、a:\evil 这类绝对路径
+        // （join 遇到绝对路径会整个丢掉 out_dir）。
+        let safe = crate::path_safety::safe_join_under(out_dir, &name)
+            .map_err(|x| format!("压缩包里有越界条目，已中止: {}", x))?;
         if name.ends_with('/') {
-            let _ = std::fs::create_dir_all(out_dir.join(&name));
+            let _ = std::fs::create_dir_all(&safe);
             continue;
         }
         // 跳到本地头之后的数据区
@@ -1003,7 +1014,7 @@ fn unzip_virtual<R: Read + Seek>(r: &mut R, total: u64, out_dir: &Path) -> Resul
         let skip = u16le(&lh[26..28]) as u64 + u16le(&lh[28..30]) as u64;
         r.seek(std::io::SeekFrom::Start(lho + 30 + skip)).map_err(|e| e.to_string())?;
 
-        let out_path = out_dir.join(name.replace('\\', "/"));
+        let out_path = safe;
         if let Some(par) = out_path.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
         let mut out = std::fs::File::create(&out_path).map_err(|e| format!("创建 {} 失败: {}", name, e))?;
         let mut hasher = crc32fast::Hasher::new();
@@ -1098,6 +1109,27 @@ pub fn extract_full_package(app: &tauri::AppHandle, game_id: &str, dest: &str, v
 ///   → 3 删除(只改名为 .qold，不真删) → 4 校验门(逐条复核 md5) → ★提交点★
 ///   → 5 删 .qold + 写 config.ini 版本号 → journal 收尾
 /// 任何一步失败/断电：config.ini 未被改、原件都还在（.qold），可「继续更新」或「↩ 回滚」。
+/// QL-06：把路径规范化成"小写路径段"序列，用于逐段比较。
+/// 处理 verbatim 前缀（\\?\）、大小写、混合分隔符、结尾分隔符与空段。
+fn path_segments(p: &str) -> Vec<String> {
+    let s = p.trim().to_lowercase();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    s.split(['\\', '/'])
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_string())
+        .collect()
+}
+
+/// QL-06：判断进程 exe 是否真的位于游戏目录之下。
+/// 不能对字符串做 starts_with：C:\Games\Example 会匹配 C:\Games\ExampleBackup\x.exe。
+/// 误判后果是"明明没在跑却报游戏正在运行"（>10MB），或把无关的轻量进程当僵尸清理（≤10MB）。
+fn exe_under_dir(exe: &str, game_dir: &str) -> bool {
+    let e = path_segments(exe);
+    let d = path_segments(game_dir);
+    if d.is_empty() || e.len() < d.len() { return false; }
+    e[..d.len()] == d[..]
+}
+
 pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_run: bool) -> Result<String, String> {
     let game_dir = crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?;
     let gdir = PathBuf::from(&game_dir);
@@ -1107,6 +1139,33 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
     ).map_err(|e| format!("解析 hdiffmap.json 失败: {}", e))?;
     let mut replace_files: Vec<PathBuf> = Vec::new();
     walk_replace_files(&extracted, &extracted, &mut replace_files);
+
+    // QL-02：hdiffmap.json 的三个路径字段全部来自远程补丁包。这里先在任何写盘动作之前
+    // 整体做越界校验，任何一条越界都直接中止整次补丁（fail-closed），
+    // 避免"合成到一半才发现恶意路径"。
+    for e in &map.diff_map {
+        crate::path_safety::safe_join_under(&gdir, &e.source_file_name)
+            .map_err(|x| format!("hdiffmap.json source_file_name 越界: {}", x))?;
+        crate::path_safety::safe_join_under(&gdir, &e.target_file_name)
+            .map_err(|x| format!("hdiffmap.json target_file_name 越界: {}", x))?;
+        crate::path_safety::safe_join_under(&extracted, &e.patch_file_name)
+            .map_err(|x| format!("hdiffmap.json patch_file_name 越界: {}", x))?;
+    }
+
+    // QL-08：本地二次校验。官方只给 MD5、清单也没有签名，所以哈希无法构成来源认证；
+    // 这里补的是"载荷从下载校验通过到真正被使用"之间的一致性（SHA-256 比 MD5 更强）。
+    // 没有指纹（旧版本下的补丁 / 手工准备的目录）时现场建立，不阻塞。
+    match crate::digest::check(&extracted, "hdiffmap.json")? {
+        crate::digest::Check::Verified => {}
+        crate::digest::Check::Pinned =>
+            println!("[patch] 载荷目录原先没有 SHA-256 指纹，已在本地建立，下次会核对"),
+        crate::digest::Check::Changed(list) => {
+            return Err(format!(
+                "补丁载荷与本地 SHA-256 指纹不一致，已中止（避免用到被改过的载荷）：\n{}\n→ 若确实是你自己替换过载荷，请删除 {} 后重试；否则请重新下载差分包。",
+                list.iter().take(10).cloned().collect::<Vec<_>>().join("\n"),
+                extracted.join(crate::digest::PINS_FILE).display()));
+        }
+    }
 
     // 立刻给界面一个"已受理"的反馈（预检+预演可能要十几秒）
     let _ = app.emit("patch-progress", PatchProgress {
@@ -1122,14 +1181,14 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
         let wanted_name = crate::load_config(app).get(game_id)
             .and_then(|d| Path::new(d).file_name().map(|s| s.to_string_lossy().to_lowercase()))
             .unwrap_or_default();
-        let dir_lower = game_dir.to_lowercase();
         let (mut live, mut dead): (Vec<String>, Vec<u32>) = (Vec::new(), Vec::new());
         for (pid, p) in sys.processes() {
             let exe_name = p.exe().and_then(|e| e.file_name())
                 .map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
             let name = if exe_name.is_empty() { p.name().to_string_lossy().to_lowercase() } else { exe_name };
             let is_ours = !wanted_name.is_empty() && name == wanted_name;
-            let under_dir = p.exe().map(|e| e.to_string_lossy().to_lowercase().starts_with(&dir_lower)).unwrap_or(false);
+            // QL-06：逐路径段比较，不再用字符串前缀（尾部分隔符问题一并消除）
+            let under_dir = p.exe().map(|e| exe_under_dir(&e.to_string_lossy(), &game_dir)).unwrap_or(false);
             if !(is_ours || under_dir) { continue; }
             if p.memory() > 10 * 1024 * 1024 { live.push(format!("PID {} {}", pid.as_u32(), name)); }
             else { dead.push(pid.as_u32()); }
@@ -1147,9 +1206,13 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
     }
     // 0.2 可写性：把将要被覆盖的文件逐个探一遍
     let mut will_write: Vec<PathBuf> = Vec::new();
-    for e in &map.diff_map { will_write.push(gdir.join(e.target_file_name.replace('/', "\\"))); }
+    for e in &map.diff_map {
+        will_write.push(crate::path_safety::safe_join_under(&gdir, &e.target_file_name)?);
+    }
     for p in &replace_files {
-        if let Ok(rel) = p.strip_prefix(&extracted) { will_write.push(gdir.join(rel)); }
+        if let Ok(rel) = p.strip_prefix(&extracted) {
+            will_write.push(crate::path_safety::safe_join_under(&gdir, &rel.to_string_lossy())?);
+        }
     }
     will_write.push(gdir.join("config.ini"));
     let locked: Vec<String> = will_write.iter()
@@ -1172,6 +1235,12 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
 
     let delete_list: Vec<String> = std::fs::read_to_string(extracted.join("deletefiles.txt"))
         .unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    // QL-02：删除链是唯一不可回滚的路径（提交点会把 .qold 备份本身也删掉）。
+    // deletefiles.txt 来自远程补丁包，必须在做任何写盘之前逐条校验边界。
+    for rel in &delete_list {
+        crate::path_safety::safe_join_under(&gdir, rel)
+            .map_err(|x| format!("deletefiles.txt 含越界路径，已中止整次补丁: {}", x))?;
+    }
 
     // ---------- journal：断点续跑 / 回滚的依据 ----------
     let to_version = resolve_target_version(app, game_id, patch_dir).unwrap_or_default();
@@ -1198,7 +1267,7 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
         let mut diff_done = 0usize;
         let mut checked = 0usize;
         for e in &map.diff_map {
-            let new = gdir.join(e.target_file_name.replace('/', "\\"));
+            let new = crate::path_safety::safe_join_under(&gdir, &e.target_file_name)?;
             if std::fs::metadata(&new).map(|m| m.len() == e.target_file_size).unwrap_or(false)
                 && file_md5(&new).map(|h| h == e.target_file_md5).unwrap_or(false) { diff_done += 1; }
             checked += 1;
@@ -1212,8 +1281,9 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
             game_id: game_id.into(), done: 0, total: 0,
             current: "预演：核对待替换文件…".into(), status: "patching".into() });
         let rep_done = replace_files.iter().filter(|p| {
-            let rel = p.strip_prefix(&extracted).unwrap();
-            match (std::fs::metadata(p), std::fs::metadata(gdir.join(rel))) {
+            let Ok(rel) = p.strip_prefix(&extracted) else { return false };
+            let Ok(dst) = crate::path_safety::safe_join_under(&gdir, &rel.to_string_lossy()) else { return false };
+            match (std::fs::metadata(p), std::fs::metadata(&dst)) {
                 (Ok(a), Ok(b)) => a.len() == b.len(), _ => false }
         }).count();
         return Ok(format!(
@@ -1232,9 +1302,9 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
     j.phase = "synthesize".into();
     j.save(app);
     for (i, e) in map.diff_map.iter().enumerate() {
-        let old = gdir.join(e.source_file_name.replace('/', "\\"));
-        let diff = extracted.join(e.patch_file_name.replace('/', "\\"));
-        let new = gdir.join(e.target_file_name.replace('/', "\\"));
+        let old = crate::path_safety::safe_join_under(&gdir, &e.source_file_name)?;
+        let diff = crate::path_safety::safe_join_under(&extracted, &e.patch_file_name)?;
+        let new = crate::path_safety::safe_join_under(&gdir, &e.target_file_name)?;
 
         // 幂等：目标已正确 → 跳过（续跑时命中这里）
         if std::fs::metadata(&new).map(|m| m.len() == e.target_file_size).unwrap_or(false)
@@ -1318,8 +1388,8 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
     j.phase = "replace".into();
     j.save(app);
     for (i, p) in replace_files.iter().enumerate() {
-        let rel = p.strip_prefix(&extracted).unwrap().to_string_lossy().replace('\\', "/");
-        let dst = gdir.join(&rel);
+        let rel = p.strip_prefix(&extracted).map_err(|x| x.to_string())?.to_string_lossy().replace('\\', "/");
+        let dst = crate::path_safety::safe_join_under(&gdir, &rel)?;
         // 幂等：大小一致即视为已复制（写入走 .qtmp → rename，不会留下半截文件）
         let same = match (std::fs::metadata(p), std::fs::metadata(&dst)) {
             (Ok(a), Ok(b)) => a.len() == b.len(), _ => false };
@@ -1351,7 +1421,8 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
     j.phase = "delete".into();
     let mut deleted = 0usize;
     for rel in &pending_delete {
-        let f = gdir.join(rel.replace('/', "\\"));
+        // QL-02：最高危的一处 —— 这里改名 .qold，提交点再 remove_file，越界即不可回滚
+        let f = crate::path_safety::safe_join_under(&gdir, rel)?;
         if f.exists() { backup_file(&mut j, &f)?; deleted += 1; }
     }
     j.delete_done = deleted;
@@ -1365,7 +1436,7 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
         current: "校验中…".into(), status: "patching".into() });
     let mut bad: Vec<String> = Vec::new();
     for e in &map.diff_map {
-        let new = gdir.join(e.target_file_name.replace('/', "\\"));
+        let new = crate::path_safety::safe_join_under(&gdir, &e.target_file_name)?;
         let ok = std::fs::metadata(&new).map(|m| m.len() == e.target_file_size).unwrap_or(false)
             && file_md5(&new).map(|h| h == e.target_file_md5).unwrap_or(false);
         if !ok { bad.push(e.target_file_name.clone()); if bad.len() >= 10 { break; } }
@@ -1373,7 +1444,7 @@ pub fn apply_patch(app: &tauri::AppHandle, game_id: &str, patch_dir: &str, dry_r
     if bad.is_empty() {
         for p in replace_files.iter() {
             let rel = p.strip_prefix(&extracted).unwrap();
-            let dst = gdir.join(rel);
+            let dst = crate::path_safety::safe_join_under(&gdir, &rel.to_string_lossy())?;
             let ok = match (std::fs::metadata(p), std::fs::metadata(&dst)) {
                 (Ok(a), Ok(b)) => a.len() == b.len() && file_md5(p).ok() == file_md5(&dst).ok(),
                 _ => false };
@@ -1902,7 +1973,9 @@ impl GamePlatform for MihoyoPlatform {
         for (idx, part) in parts.iter().enumerate() {
             let fname = part.url.split('?').next().unwrap_or("").rsplit('/').next()
                 .unwrap_or(&format!("{}_{}.part{:03}", game_id, info.latest_version, idx + 1)).to_string();
-            let out_path = out_dir.join(&fname);
+            // L-02：fname 取自远程 URL 的最后一段，仍可能带反斜杠或绝对路径前缀
+            let out_path = crate::path_safety::safe_join_under(&out_dir, &fname)
+                .map_err(|x| format!("分卷 URL 的文件名不合法，已拒绝: {}", x))?;
             let already = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
             if part.size > 0 && already == part.size {
                 downloaded += part.size;
@@ -1994,6 +2067,15 @@ impl GamePlatform for MihoyoPlatform {
                     }
                 }
             }
+            // QL-08：解压完立刻按 SHA-256 建本地指纹。这份载荷已通过官方逐卷 md5 校验，
+            // 真正 apply 之前会再核对一次，封住"校验通过 → 实际使用"之间被改动的窗口。
+            let extract_dir = out_dir.join("extracted");
+            if extract_dir.is_dir() {
+                match crate::digest::pin(&extract_dir, "hdiffmap.json") {
+                    Ok(_) => println!("[patch] 已记录本地 SHA-256 指纹: {}", extract_dir.display()),
+                    Err(e) => println!("[patch] 建立本地 SHA-256 指纹失败（不影响本次下载）: {}", e),
+                }
+            }
         } else {
             // 整包：合并分卷 + 自动解压（不然还得用户自己拿 7-Zip 打开 .001 手动解）
             let keep = read_channels(app).keep_volumes_after_extract.unwrap_or(true);
@@ -2008,5 +2090,40 @@ impl GamePlatform for MihoyoPlatform {
         }
         let _ = app.emit("download-progress", DownloadProgress { game_id: game_id.into(), downloaded, total, speed: 0, eta_seconds: Some(0), status: format!("done:{}", dest) });
         Ok(format!("{} 个分卷已下载到 {}{}", saved.len(), dest, extract_note))
+    }
+}
+
+#[cfg(test)]
+mod ql06_tests {
+    use super::exe_under_dir;
+
+    #[test]
+    fn accepts_exe_inside_game_dir() {
+        assert!(exe_under_dir(r"C:\Games\Example\x.exe", r"C:\Games\Example"));
+        assert!(exe_under_dir(r"C:\Games\Example\sub\x.exe", r"C:\Games\Example"));
+        assert!(exe_under_dir(r"C:\Games\Example\x.exe", r"C:\Games\Example\"));
+        assert!(exe_under_dir(r"c:\games\example\x.exe", r"C:\Games\Example"));
+        assert!(exe_under_dir(r"C:/Games/Example/x.exe", r"C:\Games\Example"));
+        assert!(exe_under_dir(r"\\?\C:\Games\Example\x.exe", r"C:\Games\Example"));
+    }
+
+    #[test]
+    fn rejects_sibling_dir_with_shared_prefix() {
+        // 报告里的误判用例：字符串前缀检查会通过，逐段比较必须拒绝
+        let dir = r"C:\Games\Example";
+        let exe = r"C:\Games\ExampleBackup\x.exe";
+        assert!(exe.to_lowercase().starts_with(&dir.to_lowercase()), "前提：字面前缀确实成立");
+        assert!(!exe_under_dir(exe, dir), "同前缀的兄弟目录必须拒绝");
+
+        assert!(!exe_under_dir(r"C:\Games\Example2\x.exe", r"C:\Games\Example"));
+        assert!(!exe_under_dir(r"D:\Games\Example\x.exe", r"C:\Games\Example"));
+        assert!(!exe_under_dir(r"C:\Games\Ex\x.exe", r"C:\Games\Example"));
+    }
+
+    #[test]
+    fn rejects_empty_or_shallower_paths() {
+        assert!(!exe_under_dir(r"C:\Games\x.exe", ""));
+        assert!(!exe_under_dir("", r"C:\Games\Example"));
+        assert!(!exe_under_dir(r"C:\Games\x.exe", r"C:\Games\Example"));
     }
 }

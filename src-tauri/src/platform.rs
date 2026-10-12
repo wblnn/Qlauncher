@@ -103,6 +103,12 @@ pub trait GamePlatform: Send + Sync {
     fn remote_info(&self, _app: &tauri::AppHandle, _game_id: &str) -> Result<RemoteGameInfo, String> {
         Err("该平台不支持在线获取信息".into())
     }
+    /// QL-04 补充：带取消令牌的 remote_info。默认忽略令牌，直接走 remote_info；
+    /// 会做长时间本地对账的平台（库洛）覆盖它，在步骤之间轮询令牌，
+    /// 避免调用方超时返回后后台线程一直跑（线程泄漏）。
+    fn remote_info_cancellable(&self, app: &tauri::AppHandle, game_id: &str, _cancel: Arc<AtomicBool>) -> Result<RemoteGameInfo, String> {
+        self.remote_info(app, game_id)
+    }
     fn download(&self, _app: &tauri::AppHandle, _game_id: &str, _dest: &str, _use_patch: bool, _allow_old: bool, _cancel: Arc<AtomicBool>) -> Result<String, String> {
         Err("该平台不支持在线下载".into())
     }

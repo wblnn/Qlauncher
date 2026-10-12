@@ -129,15 +129,29 @@ fn read_override(app: &tauri::AppHandle, game_id: &str) -> Option<KuroOverride> 
     }))
 }
 
+/// QL-05：channels.json 的 api 覆盖必须指向库洛官方 https 域。
+/// 否则"改一个配置文件"就能把整条更新链指向恶意服务器，进而触发越界写/删。
+fn is_trusted_kuro_api(api: &str) -> bool {
+    crate::trust::is_trusted_https_host(api, &["kurogame.com"])
+}
+
 /// 解析出最终要用的配置端点
 fn resolve_endpoint(app: &tauri::AppHandle, g: &KuroGame) -> (String, String, String) {
     let ov = read_override(app, g.id).unwrap_or_default();
     let gid = ov.game_id.unwrap_or_else(|| g.game_id.to_string());
     let key = ov.app_key.unwrap_or_else(|| g.app_key.to_string());
-    let api = ov.api.unwrap_or_else(|| {
+    let builtin = {
         let cn = ov.cn.unwrap_or(g.cn);
         if cn { KURO_API_CN } else { KURO_API_GLOBAL }.to_string()
-    });
+    };
+    let api = match ov.api {
+        Some(a) if is_trusted_kuro_api(&a) => a,
+        Some(a) => {
+            eprintln!("[kuro] 已忽略 channels.json 里不可信的 api 覆盖（只允许 https 库洛官方域）: {}", a);
+            builtin
+        }
+        None => builtin,
+    };
     (api, gid, key)
 }
 
@@ -296,6 +310,13 @@ fn fetch_manifest(cfg: &KuroConfig, cdn: &str) -> Result<Vec<KuroEntry>, String>
     }
     let m: KuroManifest = serde_json::from_slice(&raw).map_err(|e| format!("解析清单失败: {}", e))?;
     if m.resource.is_empty() { return Err("清单里没有文件条目".into()); }
+    // L-03：dest 是远程清单给出的落盘相对路径，必须在进入任何文件操作之前逐条校验，
+    // 一条越界即拒绝整份清单（fail-closed）。
+    for e in &m.resource {
+        if e.dest.is_empty() { continue; }
+        crate::path_safety::validate_relative(&e.dest)
+            .map_err(|x| format!("库洛清单里的 dest 越界，已拒绝整份清单: {}", x))?;
+    }
     Ok(m.resource)
 }
 
@@ -328,7 +349,9 @@ fn write_local_version(root: &Path, ver: &str) {
 }
 /// 本地文件大小（不存在 = None）
 fn local_size(root: &Path, dest: &str) -> Option<u64> {
-    std::fs::metadata(root.join(dest.replace('/', "\\"))).ok().map(|m| m.len())
+    // L-03：dest 来自远程清单，越界一律当作"不存在"（后续下载会再拒绝一次）
+    let p = crate::path_safety::safe_join_under(root, dest).ok()?;
+    std::fs::metadata(p).ok().map(|m| m.len())
 }
 fn file_md5(path: &Path) -> Result<String, String> {
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -376,7 +399,8 @@ struct FileDiff {
 
 /// 内容级核对单个文件。Ok(None) = 完全一致（跳过）；cancel → Err("已取消…")
 fn verify_local_file(root: &Path, e: &KuroEntry, cancel: &AtomicBool) -> Result<Option<FileDiff>, String> {
-    let p = root.join(e.dest.replace('/', "\\"));
+    // L-03：对账只读，但同样不能越界读盘
+    let p = crate::path_safety::safe_join_under(root, &e.dest)?;
     let meta = match std::fs::metadata(&p) {
         Ok(m) => m,
         Err(_) => {
@@ -543,7 +567,8 @@ fn download_entry(
 ) -> Result<(), String> {
     let e = &diff.entry;
     sh.set_current(&e.dest);
-    let target = root.join(e.dest.replace('/', "\\"));
+    // L-03：落位目标（会 create_dir_all / copy / rename / 删 .qold），必须逐条校验
+    let target = crate::path_safety::safe_join_under(root, &e.dest)?;
     if let Some(par) = target.parent() { std::fs::create_dir_all(par).map_err(|x| x.to_string())?; }
     let tmp = PathBuf::from(format!("{}.{}", target.display(), TMP_EXT));
     let url = file_url(cdn, cfg, e);
@@ -817,8 +842,8 @@ fn kuro_verify_inner(app: &tauri::AppHandle, game_id: &str, deep: bool) -> Resul
     let root = PathBuf::from(crate::load_config(app).get(game_id).cloned().ok_or("游戏未绑定目录")?);
     let (cfg, cdns, _) = fetch_config(app, g)?;
     let manifest = fetch_manifest(&cfg, &cdns[0])?;
+    // QL-04：令牌由 acquire_task 新建（初值 false），这里不再重置 —— 否则刚启动就点取消会被吞掉
     let cancel = crate::cancel_flag(game_id);
-    cancel.store(false, AtomicOrdering::SeqCst);
     let total = manifest.iter()
         .filter(|e| !e.dest.is_empty() && !e.dest.ends_with('/') && e.size > 0).count();
 
@@ -955,9 +980,14 @@ impl GamePlatform for KuroPlatform {
     }
 
     fn remote_info(&self, app: &tauri::AppHandle, game_id: &str) -> Result<RemoteGameInfo, String> {
+        self.remote_info_cancellable(app, game_id, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// QL-04 补充：把取消令牌带进本地对账，调用方超时后线程能自己停下（不再泄漏）
+    fn remote_info_cancellable(&self, app: &tauri::AppHandle, game_id: &str, cancel: Arc<AtomicBool>) -> Result<RemoteGameInfo, String> {
         let a = app.clone();
         let g = game_id.to_string();
-        on_worker(move || remote_info_inner(&a, &g))
+        on_worker(move || remote_info_inner(&a, &g, &cancel))
     }
 
     fn download(&self, app: &tauri::AppHandle, game_id: &str, dest: &str, _use_patch: bool, _allow_old: bool, cancel: Arc<AtomicBool>) -> Result<String, String> {
@@ -966,10 +996,13 @@ impl GamePlatform for KuroPlatform {
 }
 
 /// 查版本：配置索引 + 官方清单 + 本地对账（size 快扫 + 关键文件 md5 定版本）
-fn remote_info_inner(app: &tauri::AppHandle, game_id: &str) -> Result<RemoteGameInfo, String> {
+fn remote_info_inner(app: &tauri::AppHandle, game_id: &str, cancel: &AtomicBool) -> Result<RemoteGameInfo, String> {
     let g = game_def(game_id).ok_or("未知的库洛游戏")?;
+    if cancel.load(AtomicOrdering::Relaxed) { return Err("已取消".into()); }
     let (cfg, cdns, api) = fetch_config(app, g)?;
+    if cancel.load(AtomicOrdering::Relaxed) { return Err("已取消".into()); }
         let manifest = fetch_manifest(&cfg, &cdns[0])?;
+        if cancel.load(AtomicOrdering::Relaxed) { return Err("已取消".into()); }
         let total: u64 = manifest.iter().map(|e| e.size).sum();
 
         // 本地对账：size 快扫（不做全量 md5，80GB 太慢）+ 关键文件 md5 定版本
@@ -979,6 +1012,7 @@ fn remote_info_inner(app: &tauri::AppHandle, game_id: &str) -> Result<RemoteGame
                 let changed = diff_entries(r, &manifest);
                 let mut key_same = true;
                 for k in KEY_FILES {
+                    if cancel.load(AtomicOrdering::Relaxed) { return Err("已取消".into()); }
                     if let Some(e) = manifest.iter().find(|e| e.dest == *k) {
                         match file_md5(&r.join(k.replace('/', "\\"))) {
                             Ok(h) if h.eq_ignore_ascii_case(&e.md5) => {}
