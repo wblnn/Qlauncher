@@ -1,6 +1,6 @@
 # qlauncher
 
-A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 + TypeScript**. It unifies multiple distribution platforms (miHoYo, Steam, Riot) behind a single interface: it auto-scans your machine for installed games, checks remote versions, supports full & differential (patch) downloads with low-resource streaming and speed limits, and launches games with one click.
+A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 + TypeScript**. It unifies multiple distribution platforms (miHoYo, Kuro, Steam, Riot) behind a single interface: it auto-scans your machine for installed games, checks remote versions, supports full-package downloads, differential patching and Sophon chunk-based reconciliation updates, provides verify / repair / rollback capabilities, and launches or kills games with one click.
 
 > The backend currently relies heavily on the Windows registry (`winreg`); it is primarily developed and verified on **Windows**.
 
@@ -10,18 +10,24 @@ A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 +
 
 - **Multi-platform aggregation**: each platform is abstracted behind a unified `GamePlatform` trait, with capability tiers:
   - `Aggregate` (entry point only, e.g. Riot)
-  - `DirectLaunch` (can be launched directly, e.g. Steam)
-  - `Download` / `Full` (version check + download + launch, e.g. miHoYo)
+  - `DirectLaunch` (protocol launch, e.g. Steam)
+  - `Download` / `Full` (version check + download + launch + verify/repair, e.g. miHoYo, Kuro)
+- **Region-merged cards**: CN and global editions of the same game are two separate backend ids but rendered as a single card in the frontend with a region switcher (the choice is persisted in `localStorage`)
 - **Installed-game scanning**: reads the Windows uninstall registry keys plus per-platform directory rules to detect install paths, executables and local version numbers; cloud-gaming entries are filtered out automatically
 - **Manual binding**: when the registry scan comes up empty, bind a game directory manually via a folder-picker dialog (exe candidate names are declared by each platform)
 - **Official-launcher detection**: locates the locally installed official launcher (HoYoPlay / Steam / Riot Client) from the registry and launches it with one click; falls back to the official website when not found, and a "web-only" mode is also available
-- **Version guard (P0)**: semantic version comparison — downloads are only allowed when the state is `fresh` (not installed) or `ahead` (remote has an update); if the API's package lags behind the local version it is marked `behind` and downloading is blocked, preventing "updates that make your game older"
-- **Full / differential downloads**: patches are preferred (with patch size shown; refused when the local version doesn't match `patch_from`), falling back to full packages; both support multi-part packages (`parts`); patch `.7z` archives are auto-extracted into `extracted/`
-- **Low-resource streaming downloads**: configurable streaming buffer (`download_buffer_mb`, larger = lower CPU usage), smooth CPU-yielding speed limit (`download_speed_limit_mbps`) and a disk-usage safety line (`download_limit_mb`)
+- **Version guard (P0)**: semantic version comparison — regular downloads are only allowed when the state is `fresh` (not installed) or `ahead` (remote has an update); if the API's package lags behind the local version it is marked `behind` and downloading is blocked, preventing "updates that make your game older". When the full package stops being updated, the real version can be inferred from announcements / pre-download info (labeled "inferred" in the UI)
+- **Three update engines**:
+  - **HYP full / differential** (e.g. Zenless Zone Zero): fetches the multi-part list (`parts`: url / md5 / size), streams each part to disk; a differential `.7z` is auto-extracted and then applied file-by-file with `hpatchz.exe` (old file + delta → new file)
+  - **Sophon chunk reconciliation** (Genshin Impact / Honkai: Star Rail): parses the official zstd + protobuf manifests (`sophon.rs`), compares local files chunk by chunk against the manifest, and downloads only the changed chunks, assembling them directly into place — no full package required
+  - **Kuro official-manifest reconciliation** (Wuthering Waves CN/global, PGR): fetches the official file manifest (validating the manifest's own md5 first to guard against stale CDNs), reconciles locally with a fast size scan plus content-level chunk-md5 verification, re-downloads only mismatched files, with multi-CDN failover
+- **Resume / rollback (journal)**: patch application writes a `PatchJournal` throughout; interrupted patches can be continued with `resume_patch` or reverted with `rollback_patch`; backups use same-volume renames to `.qold` (zero-copy), temp files use the `.qkuro` / `.qtmp` suffixes
+- **Verify & repair**: `verify_game_files` produces reports in two modes — quick (size) or deep (content md5); `repair_game_files` fills in the differences file-by-file according to the official hash manifest (`res_list_url`)
+- **Low-resource streaming downloads**: configurable streaming buffer (`download_buffer_mb`, larger = lower CPU usage), smooth CPU-yielding speed limit (`download_speed_limit_mbps`), a disk-usage safety line (`download_limit_mb`) and a pre-download free-space check (`install_size`)
 - **Resume-friendly**: parts already fully present on disk (matching size) are skipped when restarting a download
-- **Real-time progress**: progress events (downloaded / total / instantaneous speed / ETA) emitted ~every 500 ms; cancel anytime with partial-file cleanup
-- **Running-state detection**: polls processes via `sysinfo`, distinguishing "running / installed / not installed" in the UI
-- **API self-diagnosis**: built-in 🔬 self-check command printing HYP API connectivity, `launcher_id` source, safety-line settings and package-parsing results to help debug broken APIs
+- **Real-time progress**: progress events (downloaded / total / instantaneous speed / ETA) emitted ~every 500 ms via `download-progress`; cancel anytime with partial-file cleanup
+- **Running-state detection & process management**: polls processes with `sysinfo`, distinguishing "running / installed / not installed" in the UI; supports `kill_game`, scanning leftover zombie processes (`list_zombie_games`) and killing them by pid
+- **API self-diagnosis**: built-in 🔬 self-check command (`probe_api`) printing HYP API connectivity, `launcher_id` provenance, safety-line settings and package-parsing results to help debug broken APIs
 
 ## Tech Stack
 
@@ -29,126 +35,163 @@ A cross-platform game launcher / download manager built with **Tauri 2 + Vue 3 +
 | --- | --- |
 | Frontend | Vue 3 `<script setup>`, TypeScript, Vite |
 | Desktop framework | Tauri 2 (`@tauri-apps/api` v2) |
-| Plugins | `tauri-plugin-dialog` (folder picker), `tauri-plugin-opener` (open links / programs) |
-| Backend (Rust) | `reqwest` (HTTP), `md5` (checksums), `sevenz-rust` (7z extraction), `sysinfo` (processes), `winreg` (registry) |
+| Plugins | `tauri-plugin-dialog` (folder picker), `tauri-plugin-opener` (open links/programs) |
+| Backend | Rust: `reqwest` (HTTP), `md5` (hashing), `sevenz-rust` / `flate2` + `crc32fast` (extraction), `sysinfo` (processes), `winreg` (registry), `prost` + `zstd` (Sophon manifest decoding) |
+| External tool | `hpatchz.exe` (HDiffPatch, single-file delta synthesis, shipped alongside the app) |
 
-## Prerequisites
+## Requirements
 
 - Node.js 18+ (20+ recommended) and npm
-- Rust toolchain (stable) + Tauri 2 prerequisites, see the [official guide](https://tauri.app/start/prerequisites/)
-- Windows: WebView2 Runtime and MSVC build tools
+- Rust toolchain (stable) + Tauri 2 prerequisites, see the [official Tauri guide](https://tauri.app/start/prerequisites/)
+- Windows: WebView2 Runtime, MSVC build tools
+- `hpatchz.exe` is required for delta patching (place it next to `qlauncher.exe` or under `src-tauri/`; already included in the repo)
 - Recommended IDE: VS Code + Volar (Vue - Official), tauri-vscode, rust-analyzer
 
 ## Quick Start
 
 ```bash
-# Install dependencies
+# install dependencies
 npm install
 
-# Dev mode (starts the Vite dev server and the Tauri window together)
+# development mode (starts the Vite dev server and the Tauri window together)
 npm run tauri dev
 
-# Frontend only (http://localhost:1420)
+# frontend only (http://localhost:1420)
 npm run dev
 
-# Type check + frontend build
+# type check + frontend build
 npm run build
 
-# Build installer packages (targets = all: msi / exe / nsis, etc.)
+# build installers (targets = all: msi / exe / nsis, etc.)
 npm run tauri build
 ```
 
-Vite uses a fixed port `1420` (`strictPort`) and ignores file watching under `src-tauri/`; for physical-device / remote HMR, set the `TAURI_DEV_HOST` environment variable.
+Vite uses a fixed port `1420` (`strictPort`) and ignores file-watching on `src-tauri/`; for physical-device / remote HMR, set the `TAURI_DEV_HOST` environment variable.
 
 ## Project Structure
 
 ```
 .
-├── index.html                # Frontend entry
-├── vite.config.ts            # Vite + Tauri dev config (port 1420 / HMR)
-├── src/                      # Vue frontend
-│   ├── main.ts               # App bootstrap
-│   └── App.vue               # Main UI: game list, version comparison, download progress, official-site buttons
-├── src-tauri/                # Rust backend
-│   ├── tauri.conf.json       # Tauri config (window, bundle, commands)
-│   ├── channels.json         # Runtime config: launcher_id, download buffer / speed limit / usage cap
-│   ├── capabilities/default.json  # Permission declarations (core / opener / dialog)
+├── index.html                     # frontend entry
+├── vite.config.ts                 # Vite + Tauri dev config (port 1420 / HMR)
+├── src/                           # Vue frontend
+│   ├── main.ts                    # app bootstrap
+│   └── App.vue                    # main UI: region-merged cards, version comparison, download/patch
+│                                  #   progress, official-launcher/website, verify & repair,
+│                                  #   zombie-process panel, patch resume/rollback
+├── src-tauri/                     # Rust backend
+│   ├── tauri.conf.json            # Tauri config (window, bundle, frontend-backend wiring)
+│   ├── channels.json              # runtime config: launcher_id, download buffer/speed limit, hpatchz path, etc.
+│   ├── capabilities/default.json  # permission declarations (core / opener / dialog)
+│   ├── hpatchz.exe                # external delta-synthesis tool (shipped with the package)
 │   └── src/
-│       ├── main.rs           # Binary entry point
-│       ├── lib.rs            # Tauri command registration, registry scanning, official-launcher detection, process checks
-│       ├── platform.rs       # Platform abstraction trait & data structures (GameInfo / RemoteGameInfo / DownloadProgress)
+│       ├── main.rs                # binary entry
+│       ├── lib.rs                 # Tauri command registration, registry scanning, official-launcher detection, process kill/detect
+│       ├── platform.rs            # platform abstraction trait & data types (GameInfo / RemoteGameInfo / DownloadProgress)
+│       ├── sophon.rs              # Sophon engine: zstd+protobuf manifest parsing, local chunk diff, chunk download & assembly
 │       └── platforms/
-│           ├── mod.rs        # Platform registry & game_id → platform routing
-│           ├── mihoyo.rs     # miHoYo HYP API: version check, full/differential download, self-diagnosis
-│           ├── steam.rs      # Steam (direct launch)
-│           └── riot.rs       # Riot (aggregated entry)
-└── public/                   # Static assets
+│           ├── mod.rs             # platform registry and game_id → platform routing
+│           ├── mihoyo.rs          # miHoYo HYP: version query, full/patch download, hpatchz synthesis, journal, verify/repair, self-check
+│           ├── kuro.rs            # Kuro: official config/manifest APIs, raw per-file downloads, content-level reconciliation, multi-CDN failover
+│           ├── steam.rs           # Steam (direct launch via steam://run)
+│           └── riot.rs            # Riot (aggregate entry only)
+└── public/                        # static assets
 ```
 
 ## Configuration (`src-tauri/channels.json`)
 
 ```jsonc
 {
-  "launcher_id": "jGHBHlcOq1",      // HYP API launcher_id; falls back to the built-in default if empty
-  "download_limit_mb": 0,           // Disk-usage "safety line" for downloads, 0 = unlimited (truncates safely when reached; used for pipeline testing)
-  "download_buffer_mb": 4,          // Streaming write buffer size (MB), default 4; larger = lower CPU usage
-  "download_speed_limit_mbps": 10   // Download speed limit (MB/s), 0 or omitted = unlimited; implemented by yielding CPU time slices
+  "launcher_id": "jGHBHlcOq1",              // HYP API launcher_id; falls back to the built-in default when empty
+  "launcher_ids": ["jGHBHlcOq1"],           // backup launcher_id list (for self-check / rotation)
+  "download_limit_mb": 0,                   // disk-usage safety line for downloads, 0 = unlimited (download truncates safely at the line)
+  "download_buffer_mb": 4,                  // streaming write buffer size (MB), default 4, larger = lower CPU usage
+  "download_speed_limit_mbps": 10,          // download speed limit (MB/s), 0 or absent = unlimited; implemented by yielding CPU time slices
+  "hpatchz_path": "",                       // override path to hpatchz.exe; default = next to the exe → src-tauri/ fallback
+  "keep_volumes_after_extract": true,       // whether to keep original volumes after full-package extraction
+  "biz_patterns": {                         // channel adaptation: game_id → registry/directory match keywords
+    "genshin": ["hk4e", "原神"],
+    "starrail": ["hkrpg", "星穹铁道"],
+    "zenless": ["nap", "绝区零"]
+  },
+  "sophon_categories": ["游戏资源", "语音包-中文"]  // categories the Sophon updater should handle
 }
 ```
 
-Config is resolved in three tiers: **project source `src-tauri/channels.json` (primary dev config, takes effect immediately) → user app-data directory override (production) → built-in defaults**.
+Config is resolved from three sources in order: **project source `src-tauri/channels.json` (main dev config, edits take effect immediately) → user data-directory override (production) → built-in defaults**.
 
-An invalid `launcher_id` causes miHoYo API calls to return `retcode != 0`. In that case, click the 🔬 self-check button in the UI to view the report and replace this field.
+An invalid `launcher_id` makes miHoYo APIs return `retcode != 0`; click the 🔬 self-check in the UI to view the report and replace this field accordingly.
 
-## Download Pipeline
+## Update Flow Details
 
-1. `check_remote` fetches the version and part list (`parts`: url / md5 / size) and reports the `version_relation` (fresh / ahead / equal / behind)
-2. The frontend picks the mode automatically: differential when local version == `patch_from` (confirmation shows patch size), otherwise full package
-3. `start_download` re-guards on the backend: refuses `equal` (already up to date), `behind` (prevents downgrade) and patch/full version mismatches
-4. Each part is streamed into the target directory (buffer = `download_buffer_mb`) with MD5 computed on the fly:
-   - Parts whose files already exist on disk at full size are skipped (resume-friendly)
-   - Every read loop checks the cancel flag and the `download_limit_mb` safety line; exceeding it truncates the download and emits `done_test`
-   - When a speed limit is active, the expected duration per chunk is computed and any surplus time is spent sleeping, so the CPU yields instead of busy-waiting
-5. Each part is MD5-verified as soon as it finishes writing; on failure the part is deleted and an error is raised to avoid dirty files
-6. Differential packages are saved under `patch_<from>_<to>/`; `.7z` archives are automatically extracted into its `extracted/` folder afterwards, with the inner structure printed, ready for later merging
-7. Throughout the process, `download-progress` events report progress, instantaneous speed and ETA roughly every 500 ms; cancelling deletes the partial file and emits `error:已取消`
+### HYP full / differential (Zenless Zone Zero, etc.)
+
+1. `check_remote` fetches the version and the part list (`parts`: url / md5 / size) and computes `version_relation` (fresh / ahead / equal / behind)
+2. The frontend automatically picks the mode based on patch availability: differential when the local version equals `patch_from` (the confirm dialog shows the patch size), otherwise full package
+3. `start_download` applies a second guard on the backend: refuses `equal` (already latest), refuses `behind` (prevents downgrades), refuses when the patch's base version doesn't match
+4. Each part is streamed to the target directory (buffer size = `download_buffer_mb`) while its MD5 is computed on the fly; parts whose size already matches are skipped (resume-friendly); every read loop iteration checks the cancel flag and the safety line; when a speed limit is active, the expected duration per block is computed and any shortfall is slept away to yield the CPU
+5. After each part finishes, its MD5 is verified; on failure the part is deleted and an error is raised, leaving no dirty files behind
+6. `apply_patch` stage: the extracted `.7z` payload is applied file-by-file via `hpatchz old file + delta → new file`; old files are first renamed to `.qold` backups recorded in the journal; once everything succeeds, backups are deleted and the version is written to config.ini
+
+### Sophon chunk reconciliation (Genshin Impact / Honkai: Star Rail)
+
+1. Locate the manifest via `getGameBranches → getBuild`, decompress with zstd and decode the protobuf manifest with prost (`sophon.rs`)
+2. `diff_local` compares local files chunk by chunk against the manifest (only chunks whose md5 differs need fetching), producing an exact download queue — total bytes are unknown upfront, so progress is reported as chunk counts
+3. Changed chunks are streamed down and assembled directly into the target files (landed via `.qtmp` temp names); the whole process is cancellable
+4. When the full package stops being updated, the version comes from announcement / pre-download inference (`announced_version`, clearly labeled in the UI); chunk updates remain allowed in that state
+5. Verification goes through `verify_sophon`: the Sophon manifest is authoritative (the local pkg_version becomes stale after chunk updates), and per-file URL repair is deliberately disabled for the chunk system to prevent downgrades from outdated full-package URLs
+
+### Kuro official-manifest reconciliation (Wuthering Waves)
+
+1. Fetch the official launcher config to obtain the version, CDN and `indexFile`, then fetch the file manifest and validate the manifest's own md5 first (mismatch = the CDN is still serving the old version; better to fail than to download against a stale manifest)
+2. Local reconciliation has two tiers: a fast size scan (used for version checks — no reading 80 GB for that) and content-level official chunk-md5 verification (used for downloads / verification)
+3. Only mismatched files are downloaded (the official CDN serves files raw, so they land at their final size — no extraction step), with Range resume + multi-CDN failover (the manifest is re-fetched and re-checked before switching CDNs)
+4. The private incremental format `.krpdiff` is not reverse-engineered; it is replaced by a "same full manifest + re-download the differing files" strategy
 
 ## Supported Games & IDs
 
-| game_id | Name | Platform | Capability |
-| --- | --- | --- | --- |
-| `genshin` | Genshin Impact | miHoYo | Full |
-| `starrail` | Honkai: Star Rail | miHoYo | Full |
-| `zenless` | Zenless Zone Zero | miHoYo | Full |
-| `terraria` | Terraria | Steam | DirectLaunch |
-| `ravenfield` | Ravenfield | Steam | DirectLaunch |
-| `valorant` | VALORANT | Riot | Aggregate |
-| `test_notepad` | Test: Notepad | — | Full (for integration testing) |
+| game_id | Name | Platform | Capability | Update engine |
+| --- | --- | --- | --- | --- |
+| `genshin` / `genshin_global` | Genshin Impact (CN/global) | miHoYo | Full | Sophon chunks |
+| `starrail` / `starrail_global` | Honkai: Star Rail (CN/global) | miHoYo | Full | Sophon chunks |
+| `zenless` / `zenless_global` | Zenless Zone Zero (CN/global) | miHoYo | Full | HYP full/patch |
+| `wuthering_waves` / `wuthering_waves_global` | Wuthering Waves (CN/global) | Kuro | Full | official-manifest reconciliation |
+| `pgr` | Punishing: Gray Raven | Kuro | Full | official-manifest reconciliation |
+| `terraria` | Terraria | Steam | DirectLaunch | — (`steam://run`) |
+| `ravenfield` | Ravenfield | Steam | DirectLaunch | — (`steam://run`) |
+| `valorant` | VALORANT | Riot | Aggregate | — (official launcher / website fallback) |
+| `test_notepad` | Test: Notepad | — | Full (dev integration) | — |
 
-To add a game, simply register its ID in the corresponding platform's `game_ids()` and implement `remote_info` / `download` etc. as needed.
+Adding a game: append a row to the respective `*_GAMES` table in `mihoyo.rs` / `kuro.rs` (id, biz/game_id, exe candidate names, match keywords, official site); register Steam / Riot games in their platform lists. `game_ids()` is generated from the tables automatically — just implement `remote_info` / `download` and friends as needed.
 
 ## Tauri Commands
 
 | Command | Purpose |
 | --- | --- |
-| `get_installed_games` | Returns all games detected across platforms with install status |
+| `get_installed_games` | Returns all games scanned across platforms with install status |
 | `bind_game(id, dir)` | Manually bind a game directory (exe candidates declared by the platform) |
-| `launch_game(id, use_official)` | Launch a game (or invoke the official launcher protocol) |
-| `get_running_games` | Returns whether each game is currently running (`sysinfo` polling) |
-| `official_info(game_id)` | Returns the local official-launcher exe path, website URL and fallback address |
-| `open_official(game_id, mode)` | `auto`: launch local official launcher (fallback to web) / `web`: open the official site only |
-| `check_remote(game_id)` | Query the latest remote version, package size, patch availability & version relation |
-| `start_download(game_id, dest, use_patch)` | Start a download (full or differential; already-complete parts are skipped) |
-| `cancel_download(game_id)` | Cancel an in-progress download (partial files are cleaned up) |
-| `probe_api` | API self-diagnosis, returns an array of report lines |
+| `launch_game(id, use_official)` | Launch the game (or trigger the official-launcher protocol) |
+| `kill_game(game_id)` | Kill all processes belonging to a game |
+| `get_running_games` | Whether each game is currently running (`sysinfo` polling) |
+| `list_zombie_games` / `kill_process(pid)` | Scan leftover game processes / kill by pid |
+| `official_info(game_id)` | Local official-launcher exe path, official site and fallback URL |
+| `open_official(game_id, mode)` | `auto` launches the local official launcher (falls back to web) / `web` opens the website only |
+| `check_remote(game_id)` | Query the latest remote version, package size, patch availability and version relation (incl. version-source explanation) |
+| `start_download(game_id, dest, use_patch, allow_old)` | Start a download (full / patch / chunk reconciliation; completed parts auto-skipped) |
+| `cancel_download(game_id)` | Cancel an in-progress download (cleans up partial files) |
+| `apply_patch(game_id, patch_dir, dry_run)` | Synthesize a patch (hpatchz / Sophon assembly), supports dry-run |
+| `patch_status(game_id)` | Query the journal of an unfinished patch (basis for resuming) |
+| `resume_patch(game_id)` / `rollback_patch(game_id)` | Resume an interrupted patch / roll back per the journal |
+| `verify_game_files(game_id, deep)` | Verify local files (quick size mode / deep content mode), returns a report |
+| `repair_game_files(game_id)` | Repair differing files according to the official manifest |
+| `probe_api` | API self-check, returns diagnostic report lines |
 
-The frontend listens via `listen("download-progress", ...)` to receive `DownloadProgress` events and update the progress bar, speed and time remaining.
+The frontend listens to `listen("download-progress", ...)` for `DownloadProgress` events to update the progress bar, speed and remaining time; the patch-synthesis stage reuses the same event (chunk-count basis).
 
 ## Known Limitations
 
-- Registry scanning and parts of the launch logic are Windows-only; macOS / Linux require additional platform branches
-- miHoYo downloads rely on the non-public HYP API; API changes must be mirrored in `mihoyo.rs`
-- Differential downloads currently only fetch and extract the patch for inspection; there is no automatic merge / install-in-place flow yet
-- Speed-limit and buffer configuration changes take effect after restarting the app
-
-
+- Registry scanning and some launch logic are Windows-specific; macOS / Linux require additional platform branches
+- miHoYo / Kuro downloads rely on non-public APIs; API changes must be mirrored in `mihoyo.rs` / `kuro.rs` / `sophon.rs`
+- Delta patching depends on the external `hpatchz.exe`; related commands fail with a clear message about where to place it when missing
+- Kuro's private incremental format `.krpdiff` is unsupported; replaced by full-manifest-diff re-downloads
+- Speed-limit and buffer configuration changes require an app restart to take effect
