@@ -1,5 +1,6 @@
 pub mod platform;
 pub mod platforms;
+pub mod sophon;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use winreg::enums::*;
 use winreg::RegKey;
 
 use serde::Serialize;
-use crate::platform::{GameInfo, DownloadProgress, GamePlatform};
+use crate::platform::{GameInfo, DownloadProgress};
 use crate::platforms::{get_platforms, platform_for_game};
 
 // ================= 通用工具 =================
@@ -88,10 +89,69 @@ fn save_config(app: &tauri::AppHandle, map: &HashMap<String, String>) -> Result<
 }
 
 static CANCEL_FLAGS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-fn cancel_flag(game_id: &str) -> Arc<AtomicBool> {
+pub fn cancel_flag(game_id: &str) -> Arc<AtomicBool> {
     let map = CANCEL_FLAGS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap();
     guard.entry(game_id.to_string()).or_insert_with(|| Arc::new(AtomicBool::new(false))).clone()
+}
+
+/// 取进程可比较的名字：优先 exe 文件名，取不到（0 线程残骸/受保护进程）回落 sysinfo 的进程名。
+/// 之前只用 p.exe() 会把「已死但锁着游戏文件」的残骸全漏掉 —— 本次事故正是这么发生的。
+fn proc_key(p: &sysinfo::Process) -> String {
+    let exe_name = p.exe().and_then(|e| e.file_name())
+        .map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let name = if exe_name.is_empty() { p.name().to_string_lossy().to_lowercase() } else { exe_name };
+    name.trim_end_matches(".exe").to_string()
+}
+
+// ================= 🧟 僵尸/残留进程识别 =================
+#[derive(Serialize, Clone)]
+pub struct ZombieProcess {
+    pub pid: u32,
+    pub name: String,
+    pub memory: u64,
+    pub game_id: String,
+}
+
+/// 列出"名字匹配已绑定游戏、但工作集 ≤ 10MB"的残留进程
+/// （与 get_running_games 的 >10MB 判活阈值互为反面，口径一致）
+#[tauri::command(async)]
+fn list_zombie_games(app: tauri::AppHandle) -> Vec<ZombieProcess> {
+    let games = get_all_games_inner(&app);
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All);
+    let mut out = Vec::new();
+    for game in games {
+        if !game.installed { continue; }
+        if let Some(exe_path) = game.exe {
+            let wanted = Path::new(&exe_path).file_name()
+                .unwrap_or_default().to_string_lossy().to_lowercase();
+            let wanted = wanted.trim_end_matches(".exe").to_string();
+            for (pid, p) in sys.processes() {
+                if proc_key(p) == wanted && p.memory() <= 10 * 1024 * 1024 {
+                    out.push(ZombieProcess {
+                        pid: pid.as_u32(), name: proc_key(p),
+                        memory: p.memory(), game_id: game.id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 按 PID 精准清理（只杀僵尸，不误伤活游戏）
+#[tauri::command]
+fn kill_process(pid: u32) -> Result<String, String> {
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "taskkill", "/F", "/PID", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("调用 taskkill 失败: {}", e))?;
+    if output.status.success() {
+        Ok(format!("已结束 PID {}", pid))
+    } else {
+        Err(format!("结束失败: {}", String::from_utf8_lossy(&output.stderr)))
+    }
 }
 
 // ================= 官方启动器识别（本地优先） =================
@@ -121,7 +181,7 @@ pub fn find_local_launcher(platform_id: &str) -> Option<String> {
     None
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn official_info(game_id: String) -> Result<OfficialInfo, String> {
     let platform = platform_for_game(&game_id).ok_or("无平台支持")?;
     Ok(OfficialInfo {
@@ -159,10 +219,10 @@ fn get_all_games_inner(app: &tauri::AppHandle) -> Vec<GameInfo> {
     get_platforms().iter().flat_map(|p| p.detect(app)).collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_installed_games(app: tauri::AppHandle) -> Vec<GameInfo> { get_all_games_inner(&app) }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn bind_game(app: tauri::AppHandle, id: String, dir: String) -> Result<GameInfo, String> {
     let platform = platform_for_game(&id).ok_or("无平台支持")?;
     // P3：exe 候选名由平台自己声明
@@ -194,6 +254,42 @@ fn launch_game(app: tauri::AppHandle, id: String, use_official: bool) -> Result<
 }
 
 #[tauri::command]
+fn kill_game(app: tauri::AppHandle, game_id: String) -> Result<String, String> {
+    if game_id == "test_notepad" {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "taskkill", "/F", "/IM", "notepad.exe", "/T"])
+            .output();
+        return Ok("已发送关闭记事本指令".into());
+    }
+
+    let games = get_all_games_inner(&app);
+    let game = games.into_iter().find(|g| g.id == game_id)
+        .ok_or("找不到该游戏配置")?;
+    
+    let exe_path = game.exe.ok_or("该游戏未绑定 exe 路径")?;
+    let exe_name = Path::new(&exe_path).file_name()
+        .ok_or("无法解析 exe 文件名")?
+        .to_string_lossy();
+
+    // /F = 强制结束, /IM = 镜像名(exe名), /T = 结束进程树(防反作弊残留)
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "taskkill", "/F", "/IM", &exe_name, "/T"])
+        .output()
+        .map_err(|e| format!("调用 taskkill 失败: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    
+    if output.status.success() {
+        Ok(format!("已强制关闭 {} 及其子进程", exe_name))
+    } else if stderr.contains("没有找到进程") || stdout.contains("没有找到进程") {
+        Ok(format!("{} 当前未在运行", exe_name))
+    } else {
+        Err(format!("关闭失败: {} {}", stdout, stderr))
+    }
+}
+
+#[tauri::command(async)]
 fn get_running_games(app: tauri::AppHandle) -> HashMap<String, bool> {
     let games = get_all_games_inner(&app);
     let mut sys = System::new();
@@ -205,33 +301,44 @@ fn get_running_games(app: tauri::AppHandle) -> HashMap<String, bool> {
             let wanted = Path::new(&exe_path).file_name().unwrap_or_default().to_string_lossy().to_lowercase();
             let wanted = wanted.trim_end_matches(".exe").to_string();
             let is_running = sys.processes().values().any(|p| {
-                let name = p.exe().and_then(|e| e.file_name()).unwrap_or_default().to_string_lossy().to_lowercase();
-                name.trim_end_matches(".exe") == wanted && p.memory() > 10 * 1024 * 1024
+                proc_key(p) == wanted && p.memory() > 10 * 1024 * 1024
             });
             status_map.insert(game.id, is_running);
         }
     }
     let notepad_running = sys.processes().values().any(|p| {
-        let name = p.exe().and_then(|e| e.file_name()).unwrap_or_default().to_string_lossy().to_lowercase();
-        name.trim_end_matches(".exe") == "notepad" && p.memory() > 1024 * 1024
+        proc_key(p) == "notepad" && p.memory() > 1024 * 1024
     });
     status_map.insert("test_notepad".to_string(), notepad_running);
     status_map
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn check_remote(app: tauri::AppHandle, game_id: String) -> Result<crate::platform::RemoteGameInfo, String> {
-    platform_for_game(&game_id).ok_or("无平台支持")?.remote_info(&app, &game_id)
+    // ⚠️ 网络请求一律丢到独立系统线程：本命令是 (async)，函数体跑在 tokio worker 上，
+    //    在那里创建/析构 reqwest::blocking 客户端会 panic（Cannot drop a runtime…）
+    //    → 命令既不返回也不报错、前端「点了没反应」。顺带加硬超时，网络卡住不会挂死。
+    let platform = platform_for_game(&game_id).ok_or("无平台支持")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(platform.remote_info(&app, &game_id));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(90))
+        .map_err(|_| "查版本超时（90 秒）：网络太慢或接口不可达，稍后重试".to_string())?
 }
 
 #[tauri::command]
-fn start_download(app: tauri::AppHandle, game_id: String, dest: String, use_patch: bool) -> Result<String, String> {
+fn start_download(app: tauri::AppHandle, game_id: String, dest: String, use_patch: Option<bool>, allow_old: Option<bool>) -> Result<String, String> {
+    // 前端可能传 null（JS 的 && 链很容易把 null 原样送过来）—— 这里宽容成 false，
+    // 免得好端端的下载被 "invalid args: invalid type: null, expected a boolean" 拦住
+    let use_patch = use_patch.unwrap_or(false);
+    let allow_old = allow_old.unwrap_or(false);
     let platform = platform_for_game(&game_id).ok_or("无平台支持")?;
     let flag = cancel_flag(&game_id);
     flag.store(false, Ordering::SeqCst);
     let app2 = app.clone(); let gid = game_id.clone();
     std::thread::spawn(move || {
-        if let Err(e) = platform.download(&app2, &gid, &dest, use_patch, flag) {
+        if let Err(e) = platform.download(&app2, &gid, &dest, use_patch, allow_old, flag) {
             let _ = app2.emit("download-progress", DownloadProgress { 
                 game_id: gid, downloaded: 0, total: 0, speed: 0, eta_seconds: None, status: format!("error:{}", e) 
             });
@@ -247,10 +354,157 @@ fn cancel_download(game_id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn probe_api(app: tauri::AppHandle) -> Vec<String> {
     crate::platforms::mihoyo::probe_report(&app)
 }
+
+#[tauri::command(async)]
+fn apply_patch(app: tauri::AppHandle, game_id: String, patch_dir: String, dry_run: bool) -> Result<String, String> {
+    if dry_run {
+        return crate::platforms::mihoyo::apply_patch(&app, &game_id, &patch_dir, true);
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let gid = game_id.clone();
+        let res = crate::platforms::mihoyo::apply_patch(&app2, &gid, &patch_dir, false);
+        let status = match res { Ok(m) => format!("done:{}", m), Err(e) => format!("error:{}", e) };
+        let _ = app2.emit("patch-progress", crate::platforms::mihoyo::PatchProgress {
+            game_id, done: 0, total: 0, current: String::new(), status,
+        });
+    });
+    Ok("合成已在后台启动".into())
+}
+
+// ================= 更新应变：继续 / 回滚 =================
+#[tauri::command]
+fn patch_status(app: tauri::AppHandle, game_id: String) -> Option<crate::platforms::mihoyo::PatchJournal> {
+    crate::platforms::mihoyo::patch_status(&app, &game_id)
+}
+
+/// 断点续跑：用 journal 里记的 patch_dir 再跑一遍（每步幂等 + 可逆）
+#[tauri::command]
+fn resume_patch(app: tauri::AppHandle, game_id: String) -> Result<String, String> {
+    let j = crate::platforms::mihoyo::patch_status(&app, &game_id).ok_or("没有未完成的更新记录")?;
+    if j.patch_dir.is_empty() { return Err("更新记录里没有补丁目录，无法续跑（可改用『↩ 回滚』）".into()); }
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let gid = game_id.clone();
+        let res = crate::platforms::mihoyo::apply_patch(&app2, &gid, &j.patch_dir, false);
+        let status = match res { Ok(m) => format!("done:{}", m), Err(e) => format!("error:{}", e) };
+        let _ = app2.emit("patch-progress", crate::platforms::mihoyo::PatchProgress {
+            game_id: gid, done: 0, total: 0, current: String::new(), status });
+    });
+    Ok("继续更新已在后台启动".into())
+}
+
+/// 一键回滚到补丁前：还原 .qold、删掉本次新增文件、复原 config.ini
+#[tauri::command(async)]
+fn rollback_patch(app: tauri::AppHandle, game_id: String) -> Result<String, String> {
+    crate::platforms::mihoyo::rollback_patch(&app, &game_id)
+}
+
+// ================= 🩹 校验修复 =================
+/// 按官方清单（pkg_version）逐文件校验本地：快速=只比大小，deep=逐文件算 md5。
+/// 重活丢进独立线程并带超时 —— 同 hyp_get 的理由：命令是 (async)，函数体会跑在运行时线程上。
+#[tauri::command(async)]
+fn verify_game_files(app: tauri::AppHandle, game_id: String, deep: bool) -> Result<crate::platforms::mihoyo::VerifyReport, String> {
+    // 库洛（鸣潮）：没有 pkg_version，走"官方清单对账"；同样丢线程 + 超时
+    if is_kuro(&game_id) {
+        let gid = game_id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::platforms::kuro::kuro_verify(&app2, &gid, deep));
+        });
+        // 内容级对账要把安装目录读一遍（80GB 大约几分钟），给足时间
+        return match rx.recv_timeout(std::time::Duration::from_secs(3600)) {
+            Ok(v) => v,
+            Err(_) => {
+                // 超时不能只回 Err：后台线程还在读整盘，必须置取消位让它自己停下
+                cancel_flag(&game_id).store(true, Ordering::SeqCst);
+                Err("库洛对账超时（60 分钟）：已请求中止后台对账（已核对的部分不受影响）".to_string())
+            }
+        };
+    }
+    let gid = game_id.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::platforms::mihoyo::verify_files(&app2, &gid, deep));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(1800)) {
+        Ok(v) => v,
+        Err(_) => {
+            // 同理：让后台的逐文件校验看到取消位后自己收尾
+            cancel_flag(&game_id).store(true, Ordering::SeqCst);
+            Err("校验超时（30 分钟）：已请求中止后台校验（未改动任何文件）".to_string())
+        }
+    }
+}
+
+fn is_kuro(game_id: &str) -> bool {
+    platform_for_game(game_id).map(|p| p.id() == "kuro").unwrap_or(false)
+}
+
+/// 按校验结果只补缺失/损坏的文件（不等同整包重装）
+#[tauri::command(async)]
+fn repair_game_files(app: tauri::AppHandle, game_id: String) -> Result<String, String> {
+    // 库洛：清单差异集重下（引擎自带分块续传 + 官方 md5 校验），作用在已绑定目录。
+    // 鸣潮一次可能要下几十 GB，所以这里只"点火"不等待，进度/结果都走事件（同 start_download）。
+    if is_kuro(&game_id) {
+        let dir = crate::load_config(&app).get(&game_id).cloned().ok_or("游戏未绑定目录")?;
+        let cancel = cancel_flag(&game_id);
+        cancel.store(false, Ordering::SeqCst);
+        let app2 = app.clone();
+        let gid = game_id.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::platforms::kuro::kuro_download(&app2, &gid, &dir, cancel) {
+                let _ = app2.emit("download-progress", DownloadProgress {
+                    game_id: gid, downloaded: 0, total: 0, speed: 0, eta_seconds: None,
+                    status: format!("error:{}", e),
+                });
+            }
+        });
+        return Ok("库洛清单修复已启动：差异文件会逐个下载并用官方 md5 校验（进度看进度条，可随时 ✖ 取消）".into());
+    }
+    crate::platforms::mihoyo::repair_files(&app, &game_id)
+}
+
+// src-tauri/src/lib.rs
+use sysinfo::Disks;
+
+/// 检查目标路径所在磁盘的可用空间 (单位: MB)
+pub fn check_available_space_mb(path: &Path) -> Result<u64, String> {
+    let disks = Disks::new_with_refreshed_list();
+    // 规范化路径为绝对路径，确保能正确匹配挂载点
+    let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    
+    for disk in disks.list() {
+        if abs_path.starts_with(disk.mount_point()) {
+            return Ok(disk.available_space() / 1024 / 1024);
+        }
+    }
+    Err("无法识别目标路径所在磁盘分区".to_string())
+}
+
+/// hpatchz.exe 外置解析：优先 exe 同目录（打包版），回退项目目录（dev）
+pub fn find_hpatchz() -> Result<PathBuf, String> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cands.push(dir.join("hpatchz.exe"));
+        }
+    }
+    cands.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hpatchz.exe"));
+    for c in cands {
+        if c.exists() {
+            return Ok(c);
+        }
+    }
+    Err("未找到 hpatchz.exe：请把它放在 qlauncher.exe 同目录".into())
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -259,8 +513,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_installed_games, bind_game, launch_game, get_running_games,
-            check_remote, start_download, cancel_download, probe_api,official_info, open_official,
+            check_remote, start_download, cancel_download, probe_api,official_info, 
+            open_official,
+            apply_patch,
+            kill_game,list_zombie_games, kill_process,
+            patch_status, resume_patch, rollback_patch,
+            verify_game_files, repair_game_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+
+

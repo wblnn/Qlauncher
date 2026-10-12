@@ -45,6 +45,23 @@ pub struct RemoteGameInfo {
     pub local_version: Option<String>,
     /// fresh=本地未安装(可整包) ahead=远程更新(可下载) equal=已是最新 behind=接口整包滞后(禁下载)
     pub version_relation: String,
+    /// 解压后的安装体积（整包下载前用它做空间预检）
+    pub install_size: u64,
+    /// 官方散列文件基址：单文件地址 = res_list_url + "/" + 清单里的 remoteName（校验修复用）
+    pub res_list_url: String,
+    // ===== 版本源自适应：多源版本 + 来源可解释 =====
+    /// 官方公告/预下载里推断出的"当前真实版本"（整包停更时用；UI 标注"推断"）
+    pub announced_version: Option<String>,
+    /// 远程版本来源：整包 / 预下载 / 公告(推断)
+    pub version_source: String,
+    /// 本次检查时间（unix 秒）
+    pub checked_at: u64,
+    /// 实际解析到的渠道与 hyp game_id（渠道改名时能自动跟上）
+    pub resolved_biz: String,
+    pub resolved_game_id: String,
+    /// 本次实际使用的 launcher_id 及来源
+    pub launcher_id: String,
+    pub launcher_id_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +103,7 @@ pub trait GamePlatform: Send + Sync {
     fn remote_info(&self, _app: &tauri::AppHandle, _game_id: &str) -> Result<RemoteGameInfo, String> {
         Err("该平台不支持在线获取信息".into())
     }
-    fn download(&self, _app: &tauri::AppHandle, _game_id: &str, _dest: &str, _use_patch: bool, _cancel: Arc<AtomicBool>) -> Result<String, String> {
+    fn download(&self, _app: &tauri::AppHandle, _game_id: &str, _dest: &str, _use_patch: bool, _allow_old: bool, _cancel: Arc<AtomicBool>) -> Result<String, String> {
         Err("该平台不支持在线下载".into())
     }
     // P3：平台自己声明某游戏的 exe 候选名，bind_game 不再硬编码
